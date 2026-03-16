@@ -1,0 +1,548 @@
+---
+title: "Code1_data_cleaning"
+author: "Serina"
+date: "2023-07-25"
+output: html_document
+---
+There are two types of input files: a GPS file and an individual file. This code combines individual information (sex, age, and ID) with the GPS file.
+The individual file is available on GitHub, while the GPS file must be downloaded from the Biologging Intelligent Platform (BiP; https://www.bip-earth.com).
+There are two types of ID: "id" and "foot". The "id" format follows a pattern such as K13B27, where K13 refers to the collection site and year — for example, K13 indicates data collected at Kabushima in 2013 — and B27 refers to the individual ID, which may change each year.
+In contrast, "foot" refers to the metal leg band number attached to each individual through mark-recapture. This number remains constant throughout the individual's life.
+Since the GPS file contains only the label and its format varies across years, the goal of this code is to standardize the format and merge the individual information using the individual file.
+
+
+#library
+```{r}
+rm(list = ls())
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+```
+
+
+#Read GPS data
+File name and place can be different
+```{r}
+rm(list=ls())
+GPS2013 <- read_csv("~/Documents/yodalab/data/first_data/GPS/蕪島_ウミネコ_GPS_2013.csv")
+GPS2014 <- read_csv("~/Documents/yodalab/data/first_data/GPS/蕪島_ウミネコ_GPS_2014.csv")
+GPS2015 <- read_csv("~/Documents/yodalab/data/first_data/GPS/蕪島_ウミネコ_GPS_2015.csv")
+GPS2016 <- read_csv("~/Documents/yodalab/data/first_data/GPS/蕪島_ウミネコ_GPS_2016.csv")
+GPS2017 <- read_csv("~/Documents/yodalab/data/first_data/GPS/蕪島_ウミネコ_GPS_2017.csv")
+GPS2018 <- read_csv("~/Documents/yodalab/data/first_data/GPS/蕪島_ウミネコ_GPS_2018.csv")
+GPS2019 <- read_csv("~/Documents/yodalab/data/first_data/GPS/蕪島_ウミネコ_GPS_2019.csv")
+GPS2021 <- read_csv("~/Documents/yodalab/data/first_data/GPS/蕪島_ウミネコ_GPS_2021.csv")
+GPS2022 <- read_csv("~/Documents/yodalab/data/first_data/GPS/蕪島_ウミネコ_GPS_2022.csv")
+```
+
+#read 2020
+In our case, year 2020 file have different format
+```{r}
+txt_files <- list.files(path = "~/Documents/yodalab/data/first_data/GPS/2020Kabushima_GPS/", 
+                        pattern = "\\.txt$", full.names = TRUE)
+
+data_out <- tibble()
+
+for (file in txt_files) {
+  var_name <- tools::file_path_sans_ext(basename(file))
+  var_name <- gsub("PinPoint ", "VHF", var_name)
+  var_name <- gsub(" [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}-[0-9]{2}-[0-9]{2}", "", var_name)
+
+    List <- read.table(file, fill=TRUE,header=T)
+  List1 <- subset(List,List$Status=="Valid")
+
+  Df = data.frame(
+    time=as.POSIXct(strptime(paste(List1$FIX.date,List1$FIX.time), "%Y/%m/%d %H:%M:%S"), tz = "GMT"),
+    index=as.numeric(List1$Index),
+    lon=as.numeric(List1$Longitude),
+    lat=as.numeric(List1$Latitude),
+    HDOP=as.numeric(List1$HDOP),
+    logger=as.character(var_name),
+    year=2020)
+  
+  Df <- Df[Df$HDOP<=7,]
+  
+  data_out <- rbind(data_out, Df)
+}
+
+assign("GPS2020", data_out)
+
+GPS2020 <- GPS2020 %>% dplyr::select(-c(index, HDOP))
+
+GPS2020 <- GPS2020 %>%
+  dplyr::mutate(sex = "UNKNOWN") %>%
+  dplyr::select(time, lon, lat, sex, everything())
+
+GPS2020 <- rename(GPS2020, id = logger)
+
+temp_time <- as.character(GPS2020$time)
+
+temp_time <- gsub("^20-", "2020-", temp_time)
+
+GPS2020$time <- as.POSIXct(temp_time, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")
+
+head(GPS2020$time, 10)
+```
+
+#Check individual number
+```{r}
+length(unique(GPS2013$id))
+#[1] 20
+length(unique(GPS2014$id))
+#[1] 17
+length(unique(GPS2015$id))
+#[1] 21
+length(unique(GPS2016$id))
+#[1] 30
+length(unique(GPS2017$id))
+#[1] 21
+length(unique(GPS2018$id))
+#[1] 32
+length(unique(GPS2019$id))
+#[1] 28
+length(unique(GPS2020$id))
+#[1] 15
+length(unique(GPS2021$id))
+#[1] 34
+length(unique(GPS2022$id))
+#[1] 29
+```
+
+
+#Read individual files
+```{r}
+d2013 <- read_csv("~/Documents/yodalab/data/first_data/individual_cleaned/d2013_tracked.csv")
+d2014 <- read_csv("~/Documents/yodalab/data/first_data/individual_cleaned/d2014_tracked.csv")
+d2015 <- read_csv("~/Documents/yodalab/data/first_data/individual_cleaned/d2015_tracked.csv")
+d2016 <- read_csv("~/Documents/yodalab/data/first_data/individual_cleaned/d2016_tracked.csv")
+d2017 <- read_csv("~/Documents/yodalab/data/first_data/individual_cleaned/d2017_tracked.csv")
+d2018 <- read_csv("~/Documents/yodalab/data/first_data/individual_cleaned/d2018_tracked.csv")
+d2019 <- read_csv("~/Documents/yodalab/data/first_data/individual_cleaned/d2019_tracked.csv")
+d2020 <- read_csv("~/Documents/yodalab/data/first_data/individual_cleaned/d2020_tracked.csv")
+d2021 <- read_csv("~/Documents/yodalab/data/first_data/individual_cleaned/d2021_tracked.csv")
+d2022 <- read_csv("~/Documents/yodalab/data/first_data/individual_cleaned/d2022_tracked.csv")
+```
+
+#Clean up ID in GPS file
+Delete the individual which didn't recorded. Make the ID row accessible
+```{r}
+#Add individuals
+#Add K21D75(9A94429) from 2022 to 2021
+new_rows <- GPS2022[GPS2022$id == "PinPoint 45267 2022-05-25 09-53-34", ]
+new_rows$id <- "9A94429"
+GPS2021 <- rbind(GPS2021, new_rows)
+
+#Delete the individual with missing data
+#Delete "K15GLS2-event" in 2015 and "K16n44GLS","K16n46GLS" in 2016（There are GPS data but no individual data）
+#Delete "AT-52_S1","AT-52_S2","AT-52_S3" in 2019 (Those are all same individual and duplicated as different name)
+#Delete "VHF45267" in 2022（There are GPS data but no individual data）
+GPS2015 <- GPS2015[GPS2015$id != "K15GLS2-event", ]
+GPS2016 <- GPS2016[!(GPS2016$id %in% c("K16n44GLS", "K16n46GLS")), ]
+GPS2019 <- GPS2019[!(GPS2019$id %in% c("AT-52_S2", "AT-52_S3")), ]
+GPS2022 <- GPS2022[GPS2022$id != "PinPoint 45267 2022-05-25 09-53-34", ]
+```
+
+#Clean up ID in GPS file2
+Make both file using same ID format
+```{r}
+#2013
+######################################################################################
+unique(GPS2013$id)
+# [1] "B22-gps22-1"   "B22p-gps15-1"  "B28-gps20-1"   "B34-gps01-1"  
+# [5] "B36-gps35-1"   "B87-gps21-1"   "B88-gps28-1"   "B89-gps15-1"  
+# [9] "B89p-gps19"    "B95-gps18-1"   "C03-gps21-1"   "C12p-gps37-1" 
+#[13] "C40p-gps36-1"  "C66p-gps37-1"  "C98-gps11-1"   "C98p-gps19-1" 
+#[17] "D37pp-gps35-1" "D90-gps10-1"   "E26-gps11-1"   "E36-gps36-1"  
+
+GPS2013$id <- gsub("-gps.*", "", GPS2013$id)
+GPS2013$id <- paste0("K13", GPS2013$id)
+GPS2013$id <- toupper(GPS2013$id)
+GPS2013$id[GPS2013$id == "K13NA"] <- NA
+
+GPS2013$id[GPS2013$id == "K13E26"] <- "K13E16"
+
+unique(GPS2013$id)
+# [1] "K13B22"   "K13B22P"  "K13B28"   "K13B34"   "K13B36"  
+# [6] "K13B87"   "K13B88"   "K13B89"   "K13B89P"  "K13B95"  
+#[11] "K13C03"   "K13C12P"  "K13C40P"  "K13C66P"  "K13C98"  
+#[16] "K13C98P"  "K13D37PP" "K13D90"   "K13E16"   "K13E36" 
+
+#2014
+######################################################################################
+unique(GPS2014$id)
+# [1] "K14B62"   "K14B89P"  "K14B95"   "K14C03"   "K14C12"  
+# [6] "K14C12P"  "K14C13"   "K14C20"   "K14C33"   "K14C34"  
+#[11] "K14C66"   "K14C96"   "K14D03"   "K14D06"   "K14D31"  
+#[16] "K14D37P"  "K14D37PP"
+
+#No need to change
+
+#2015
+######################################################################################
+unique(GPS2015$id)
+# [1] "K15B24-event"  "K15B28-event"  "K15B62-event"  "K15B76-event" 
+# [5] "K15B87-event"  "K15B87P-event" "K15C03P-event" "K15C12-event" 
+# [9] "K15C12P-event" "K15C20-event"  "K15C20P-event" "K15C21-event" 
+#[13] "K15C33-event"  "K15C37-event"  "K15C66P-event" "K15C95-event" 
+#[17] "K15D29-event"  "K15D31-event"  "K15D66-event"  "K15E36-event" 
+
+GPS2015$id <- gsub("-event", "", GPS2015$id)
+GPS2015$id <- toupper(GPS2015$id)
+
+unique(GPS2015$id)
+# [1] "K15B24"  "K15B28"  "K15B62"  "K15B76"  "K15B87"  "K15B87P"
+# [7] "K15C03P" "K15C12"  "K15C12P" "K15C20"  "K15C20P" "K15C21" 
+#[13] "K15C33"  "K15C37"  "K15C66P" "K15C95"  "K15D29"  "K15D31" 
+#[19] "K15D66"  "K15E36" 
+
+#2016
+######################################################################################
+unique(GPS2016$id)
+# [1] "K16B45"  "K16B67"  "K16B87"  "K16C09"  "K16C12"  "K16C20" 
+# [7] "K16C20P" "K16C21"  "K16C31"  "K16C33"  "K16C37"  "K16C45" 
+#[13] "K16C52"  "K16C66"  "K16C67P" "K16C95"  "K16D06"  "K16D23" 
+#[19] "K16D29"  "K16D30"  "K16D39"  "K16D54"  "K16D79"  "K16E02" 
+#[25] "K16E15"  "K16E29"  "K16E36"  "K16F19"
+
+#No need to change
+
+#2017
+######################################################################################
+unique(GPS2017$id)
+# [1] "K17B24"  "K17B45"  "K17B56"  "K17B67"  "K17B87"  "K17B94P"
+# [7] "K17B97M" "K17C13"  "K17C37"  "K17C45"  "K17C95"  "K17D04" 
+#[13] "K17D23M" "K17D29"  "K17D79"  "K17D93"  "K17E02"  "K17E36" 
+#[19] "K17E81"  "K17E88"  "K17X2M"
+
+#No need to change
+
+#2018
+######################################################################################
+unique(GPS2018$id)
+# [1] "K18E30"    "K18E32_S1" "K18E74_S1" "K18F04"    "K18F29_S1"
+# [6] "K18F30_S1" "K18F31_S1" "K18F33"    "K18F34"    "K18F36_S2"
+#[11] "K18F38_S1" "K18F39_S1" "K18F43"    "K18F47_S1" "K18F48"   
+#[16] "K18F50_S1" "K18F51"    "K18F52_S1" "K18F57_S1" "K18F58_S2"
+#[21] "K18F60"    "K18F61_S1" "K18F62"    "K18F63_S1" "K18F64_S1"
+#[26] "K18F65_S1" "K18F67_S1" "K18F71_S1" "K18F72_S1" "K18F73_S2"
+#[31] "K18F74_S1" "K18F75_S1"
+
+GPS2018$id <- sub("_S[12]$", "", GPS2018$id)
+
+unique(GPS2018$id)
+# [1] "K18E30" "K18E32" "K18E74" "K18F04" "K18F29" "K18F30" "K18F31"
+# [8] "K18F33" "K18F34" "K18F36" "K18F38" "K18F39" "K18F43" "K18F47"
+#[15] "K18F48" "K18F50" "K18F51" "K18F52" "K18F57" "K18F58" "K18F60"
+#[22] "K18F61" "K18F62" "K18F63" "K18F64" "K18F65" "K18F67" "K18F71"
+#[29] "K18F72" "K18F73" "K18F74" "K18F75"
+
+#2019
+######################################################################################
+unique(GPS2019$id)
+# [1] "AT-110_S1" "AT-111_S1" "AT-132_S1" "AT-134_S1" "AT-139_S1"
+# [6] "AT-25_S1"  "AT-30_S1"  "AT-47_S1"  "AT-52_S1"  "H124_S1"  
+#[11] "H130_S1"   "H132_S1"   "H141_S1"   "H143_S1"   "H144_S1"  
+#[16] "H146_S2"   "H148_S1"   "H149_S1"   "H150_S1"   "H152_S1"  
+#[21] "H154_S1"   "H155_S1"   "H156_S1"   "H157_S1"   "H158_S1"  
+#[26] "H159_S1"   
+
+GPS2019$id <- sub("_S[123]$", "", GPS2019$id)
+GPS2019$id <- gsub("-", "", GPS2019$id)
+
+unique(GPS2019$id)
+# [1] "AT110" "AT111" "AT132" "AT134" "AT139" "AT25"  "AT30"  "AT47" 
+# [9] "AT52"  "H124"  "H130"  "H132"  "H141"  "H143"  "H144"  "H146" 
+#[17] "H148"  "H149"  "H150"  "H152"  "H154"  "H155"  "H156"  "H157" 
+#[25] "H158"  "H159"
+
+colnames(GPS2019)[colnames(GPS2019) == "id"] <- "logger"
+GPS2019$id <- d2019$id[match(GPS2019$logger, d2019$logger)]
+
+GPS2019 <- GPS2019 %>%
+  dplyr::select(1:3, id, 5:6, logger)
+
+unique(GPS2019$id)
+# [1] "K19F33" "K19F34" "K19F53" "K19F73" "K19F94" "K19F39" "K19E30"
+# [8] "K19F37" "K19F38" "K19D75" "K19F65" "K19F45" "K19C55" "K19F81"
+#[15] "K19F36" "K19F61" "K19D46" "K19F30" "K19F75" "K19F90" "K19D93"
+#[22] "K19F29" "K19F51" "K19D80" "K19F19" "K19C99"
+
+################Note#############
+#9B19906 and 9B19909 was mixed up, so make it to both 9B19906
+
+#2020
+######################################################################################
+unique(GPS2020$id)
+# [1] "VHF45263" "VHF45264" "VHF45265" "VHF45266" "VHF45267"
+# [6] "VHF45268" "VHF45269" "VHF45270" "VHF45271" "VHF45272"
+#[11] "VHF45273" "VHF45275" "VHF45276" "VHF45278" "VHF45279"
+
+unique(d2020$logger)
+# [1] "VHF45270" "VHF45266" "VHF45268" "VHF45269" "VHF45265"
+# [6] "VHF45272" "VHF45263" "VHF45264" "VHF45271" "VHF45276"
+#[11] "VHF45267" "VHF45279" "VHF45273" "VHF45275" "VHF45278"
+
+colnames(GPS2020)[colnames(GPS2020) == "id"] <- "logger"
+GPS2020$id <- d2020$id[match(GPS2020$logger, d2020$logger)]
+
+GPS2020 <- GPS2020 %>%
+  dplyr::select(1:3, id, 5:6, logger)
+
+unique(GPS2020$id)
+# [1] "K20D46" "K20F90" "K20D93" "K20F91" "K20D75" "K20F33" "K20F56"
+# [8] "K20F38" "K20F10" "K20F61" "K20F84" "K20F31" "K20E88" "K20F39"
+#[15] "K20C95"
+
+#2021
+######################################################################################
+unique(GPS2021$id)
+# [1] "k21_09083730_F92_M"          "k21_09083795_F69_M"         
+# [3] "k21_09213836_F97_"           "k21_09214908_F55_estimatedM"
+# [5] "k21_09214934_F45_M"          "k21_9A14461_G17_"           
+# [7] "k21_9A18573_G00_F"           "k21_9A66352_G09_M"          
+# [9] "k21_9A66400_F60_F"           "k21_9A66453_G07_M"          
+#[11] "k21_9A79458_G06_M"           "k21_9A89244_F72_F"          
+#[13] "k21_9A89795_G05_M"           "k21_9A89933_G02_M"          
+#[15] "k21_9A90297_F93_F"           "k21_9A90985_G15_"           
+#[17] "k21_9A94832_G16_F"           "k21_9B00067_F62_estimatedF" 
+#[19] "k21_9B00498_F48_estimatedF"  "k21_9B01393_G21_M"          
+#[21] "k21_9B07888_G24_"            "k21_9B07922_F49_estimatedF" 
+#[23] "k21_9B15500_G20_"            "k21_9B18555_F68_M"          
+#[25] "k21_9B19470_F71_F"           "k21_9B19803_F70_M"          
+#[27] "k21_9B19814_G08_"            "k21_9B19815_G13_"           
+#[29] "k21_9B19820_E81_M"           "k21_9B19843_G01_F"          
+#[31] "k21_9B22556_G23_"            "k21_9B25953_G22_"           
+#[33] "k21_9B30208_F73_M"           "k21_None_F29_F"             
+#[35] "9A94429"
+
+GPS2021$id[GPS2021$id == "9A94429"] <- "k21_9A94429_D75_F"
+
+GPS2021$id <- gsub("^k21_", "", GPS2021$id)
+
+GPS2021 <- dplyr::select(GPS2021, -sex)
+
+GPS2021 <- GPS2021 %>%
+  separate(col = id, into = c("f", "i", "s"), sep = "_") %>%
+  rename(new_foot = f, new_id = i, new_sex = s)
+GPS2021$new_foot <- as.character(GPS2021$new_foot)
+GPS2021$new_id <- paste0("K21", GPS2021$new_id)
+colnames(GPS2021)[colnames(GPS2021) == "new_id"] <- "id"
+colnames(GPS2021)[colnames(GPS2021) == "new_sex"] <- "sex"
+colnames(GPS2021)[colnames(GPS2021) == "new_foot"] <- "foot"
+
+GPS2021 <- GPS2021 %>%
+  dplyr::select(1:3, id, 5:7, foot)
+GPS2021$year <- 2021
+
+#Fix Typo of the original file
+GPS2021$id[GPS2021$id =="K21G24"] <- "K21G25"
+
+unique(GPS2021$id)
+# [1] "K21F92" "K21F69" "K21F97" "K21F55" "K21F45" "K21G17" "K21G00"
+# [8] "K21G09" "K21F60" "K21G07" "K21G06" "K21F72" "K21G05" "K21G02"
+#[15] "K21F93" "K21G15" "K21G16" "K21F62" "K21F48" "K21G21" "K21G25"
+#[22] "K21F49" "K21G20" "K21F68" "K21F71" "K21F70" "K21G08" "K21G13"
+#[29] "K21E81" "K21G01" "K21G23" "K21G22" "K21F73" "K21F29" "K21D75"
+
+#########Note###########
+#K21G24 is wrong, K21G25 is correct
+
+#2022
+######################################################################################
+unique(GPS2022$id)
+#  [1] "PinPoint 45264 2022-07-07 02-19-38"
+#  [2] "PinPoint 45265 2022-06-20 16-31-32"
+#  [3] "PinPoint 45268 2022-06-26 02-21-30"
+#  [4] "PinPoint 45272 2022-07-11 00-00-50"
+#  [5] "PinPoint 45273 2022-06-26 05-52-22"
+#  [6] "PinPoint 45278 2022-05-13 10-24-48"
+#  [7] "PinPoint 56074 2022-07-02 23-38-44"
+#  [8] "PinPoint 56075 2022-07-10 23-53-22"
+#  [9] "PinPoint 56076 2022-06-26 11-17-04"
+# [10] "PinPoint 56077 2022-06-26 15-16-46"
+# [11] "PinPoint 56078 2022-07-11 00-01-14"
+# [12] "PinPoint 56079 2022-07-10 23-36-06"
+# [13] "PinPoint 56081 2022-07-03 22-51-14"
+# [14] "PinPoint 56082 2022-06-26 10-14-58"
+# [15] "PinPoint 56083 2022-06-26 13-16-32"
+# [16] "PinPoint 56084 2022-07-07 02-16-22"
+# [17] "PinPoint 56085 2022-07-03 22-51-50"
+# [18] "PinPoint 56086 2022-07-02 23-42-42"
+# [19] "PinPoint 56087 2022-07-02 23-42-52"
+# [20] "PinPoint 56088 2022-07-07 02-18-56"
+# [21] "PinPoint 56089 2022-07-10 22-30-44"
+# [22] "PinPoint 56091 2022-07-10 23-50-40"
+# [23] "PinPoint 56092 2022-07-07 02-14-48"
+# [24] "PinPoint 56094 2022-07-10 23-36-28"
+# [25] "PinPoint 56095 2022-07-07 21-47-38"
+# [26] "PinPoint 56096 2022-07-07 02-14-58"
+# [27] "PinPoint 56098 2022-07-02 23-44-40"
+# [28] "PinPoint 56099 2022-07-10 23-50-50"
+
+GPS2022$id <- sub("PinPoint ", "VHF", GPS2022$id)
+GPS2022$id <- str_remove(GPS2022$id, " .*$")
+unique(GPS2022$id)
+#  [1] "VHF45264" "VHF45265" "VHF45268" "VHF45272" "VHF45273"
+#  [6] "VHF45278" "VHF56074" "VHF56075" "VHF56076" "VHF56077"
+# [11] "VHF56078" "VHF56079" "VHF56081" "VHF56082" "VHF56083"
+# [16] "VHF56084" "VHF56085" "VHF56086" "VHF56087" "VHF56088"
+# [21] "VHF56089" "VHF56091" "VHF56092" "VHF56094" "VHF56095"
+# [26] "VHF56096" "VHF56098" "VHF56099"
+
+colnames(GPS2022)[colnames(GPS2022) == "id"] <- "logger"
+GPS2022$id <- d2022$id[match(GPS2022$logger, d2022$logger)]
+
+GPS2022 <- GPS2022 %>%
+  dplyr::select(1:3, id, 5:6, logger)
+
+unique(GPS2022$id)
+# [1] "K22F68" "K22G38" "K22F43" "K22F39" "K22G24" "K22G00" "K22F29"
+# [8] "K22F49" "K22G13" "K22F73" "K22G22" "K22F92" "K22G20" "K22G06"
+#[15] "K22F51" "K22F50" "K22G30" "K22G31" "K22G04" "K22G23" "K22F55"
+#[22] "K22F48" "K22F33" "K22G07" "K22G25" "K22G17" "K22G32" "K22G05"
+```
+
+#Integrate information
+#2013
+```{r}
+GPS2013 <- GPS2013 %>% dplyr::select(-sex)
+GPS2013 <- GPS2013 %>% dplyr::select(-year)
+GPS2013<- GPS2013 %>%
+  left_join(d2013, by = c("id" = "id"))
+unique(GPS2013$foot)
+sum(is.na(GPS2013$foot))
+colnames(GPS2013)[1:10] <- c("time","lon","lat","label", "foot","age", "sex","logger","type", "year")
+GPS2013 <- GPS2013[, c("time","lon","lat", "foot","label","age", "sex", "year", "logger", "type")]
+write_csv(GPS2013, "~/Documents/yodalab/data/middle_data/GPS_cleaned/GPS2013.csv")
+```
+
+#2014
+```{r}
+GPS2014 <- GPS2014 %>% dplyr::select(-sex)
+GPS2014 <- GPS2014 %>% dplyr::select(-year)
+GPS2014<- GPS2014 %>%
+  left_join(d2014, by = c("id" = "id"))
+unique(GPS2014$foot)
+sum(is.na(GPS2014$foot))
+colnames(GPS2014)[1:10] <- c("time","lon","lat","label", "foot", "age", "sex","logger","type", "year")
+GPS2014 <- GPS2014[, c("time","lon","lat", "foot","label","age", "sex", "year", "logger", "type")]
+write_csv(GPS2014, "~/Documents/yodalab/data/middle_data/GPS_cleaned/GPS2014.csv")
+```
+
+#2015
+```{r}
+GPS2015 <- GPS2015 %>% dplyr::select(-sex)
+GPS2015 <- GPS2015 %>% dplyr::select(-year)
+GPS2015 <- GPS2015 %>%
+  left_join(d2015, by = c("id" = "id"))
+unique(GPS2015$foot)
+sum(is.na(GPS2015$foot))
+colnames(GPS2015)[1:10] <- c("time","lon","lat","label", "foot", "age", "sex","logger","type", "year")
+GPS2015 <- GPS2015[, c("time","lon","lat", "foot","label","age", "sex", "year", "logger", "type")]
+write_csv(GPS2015, "~/Documents/yodalab/data/middle_data/GPS_cleaned/GPS2015.csv")
+```
+#2016
+```{r}
+GPS2016 <- GPS2016 %>% dplyr::select(-sex)
+GPS2016 <- GPS2016 %>% dplyr::select(-year)
+GPS2016 <- GPS2016 %>%
+  left_join(d2016, by = c("id" = "id"))
+unique(GPS2016$foot)
+sum(is.na(GPS2016$foot))
+colnames(GPS2016)[1:10] <- c("time","lon","lat","label", "foot", "age", "sex","logger","type", "year")
+GPS2016 <- GPS2016[, c("time","lon","lat", "foot","label","age", "sex", "year", "logger", "type")]
+write_csv(GPS2016, "~/Documents/yodalab/data/middle_data/GPS_cleaned/GPS2016.csv")
+```
+
+#2017
+```{r}
+GPS2017 <- GPS2017 %>% dplyr::select(-sex)
+GPS2017 <- GPS2017 %>% dplyr::select(-year)
+GPS2017 <- GPS2017 %>%
+  left_join(d2017, by = c("id" = "id"))
+unique(GPS2017$foot)
+sum(is.na(GPS2017$foot))
+colnames(GPS2017)[1:10] <- c("time","lon","lat","label", "foot", "age", "sex","logger","type", "year")
+GPS2017 <- GPS2017[, c("time","lon","lat", "foot","label","age", "sex", "year", "logger", "type")]
+write_csv(GPS2017, "~/Documents/yodalab/data/middle_data/GPS_cleaned/GPS2017.csv")
+```
+
+#2018
+```{r}
+GPS2018 <- GPS2018 %>% dplyr::select(-sex)
+GPS2018 <- GPS2018 %>% dplyr::select(-year)
+GPS2018 <- GPS2018 %>%
+  left_join(d2018, by = c("id" = "id"))
+unique(GPS2018$foot)
+sum(is.na(GPS2018$foot))
+colnames(GPS2018)[1:10] <- c("time","lon","lat","label", "foot", "age", "sex","logger","type", "year")
+GPS2018 <- GPS2018[, c("time","lon","lat", "foot","label","age", "sex", "year", "logger", "type")]
+write_csv(GPS2018, "~/Documents/yodalab/data/middle_data/GPS_cleaned/GPS2018.csv")
+```
+
+#2019
+A bit different format
+```{r}
+GPS2019 <- GPS2019 %>% dplyr::select(-sex)
+GPS2019 <- GPS2019 %>% dplyr::select(-year)
+GPS2019 <- GPS2019 %>% dplyr::select(-logger)
+GPS2019 <- GPS2019 %>%
+  left_join(d2019, by = c("id" = "id"))
+unique(GPS2019$foot)
+sum(is.na(GPS2019$foot))
+colnames(GPS2019)[1:10] <- c("time","lon","lat","label", "foot", "age", "sex","logger","type", "year")
+GPS2019 <- GPS2019[, c("time","lon","lat", "foot","label","age", "sex", "year", "logger", "type")]
+write_csv(GPS2019, "~/Documents/yodalab/data/middle_data/GPS_cleaned/GPS2019.csv")
+```
+
+#2020
+A bit different format
+```{r}
+GPS2020 <- GPS2020 %>% dplyr::select(-year)
+GPS2020 <- GPS2020 %>% dplyr::select(-logger)
+GPS2020 <- GPS2020 %>%
+  left_join(d2020, by = c("id" = "id"))
+unique(GPS2020$foot)
+sum(is.na(GPS2020$foot))
+colnames(GPS2020)[1:10] <- c("time","lon","lat","label", "foot", "age", "sex","logger","type", "year")
+GPS2020 <- GPS2020[, c("time","lon","lat", "foot","label","age", "sex", "year", "logger", "type")]
+write_csv(GPS2020, "~/Documents/yodalab/data/middle_data/GPS_cleaned/GPS2020.csv")
+```
+
+#2021
+A bit different format
+```{r}
+GPS2021 <- GPS2021 %>% dplyr::select(-sex)
+GPS2021 <- GPS2021 %>% dplyr::select(-year)
+GPS2021 <- GPS2021 %>% dplyr::select(-foot)
+GPS2021 <- GPS2021 %>%
+  left_join(d2021, by = c("id" = "id"))
+unique(GPS2021$foot)
+sum(is.na(GPS2021$foot))
+colnames(GPS2021)[1:10] <- c("time","lon","lat","label", "foot", "age", "sex","logger","type", "year")
+GPS2021 <- GPS2021[, c("time","lon","lat", "foot","label","age", "sex", "year", "logger", "type")]
+write_csv(GPS2021, "~/Documents/yodalab/data/middle_data/GPS_cleaned/GPS2021.csv")
+```
+
+
+#2022
+A bit different format
+```{r}
+GPS2022 <- GPS2022 %>% dplyr::select(-sex)
+GPS2022 <- GPS2022 %>% dplyr::select(-year)
+GPS2022 <- GPS2022 %>% dplyr::select(-logger)
+GPS2022 <- GPS2022 %>%
+  left_join(d2022, by = c("id" = "id"))
+unique(GPS2022$foot)
+sum(is.na(GPS2022$foot))
+colnames(GPS2022)[1:10] <- c("time","lon","lat","label", "foot", "age", "sex","logger","type", "year")
+GPS2022 <- GPS2022[, c("time","lon","lat", "foot","label","age", "sex", "year", "logger", "type")]
+write_csv(GPS2022, "~/Documents/yodalab/data/middle_data/GPS_cleaned/GPS2022.csv")
+
+######################Caution
+#VHF45278 is 2020 data, but still included in 2022 file. It will be excluded in the later step.
+```
+
+
+
