@@ -1,7 +1,8 @@
 # Wind-drift-compensation-analysis
 Full code for cleaning GPS data acquired from GiPSy, Axy-Trek, and Pinpoint VHF attached to seabirds and analyzing it with a hierarchical Bayesian model to visualize age differences in wind drift compensation
 
-There are two types of input files: a GPS file and an individual file. The individual file is available on "Input" file, while the GPS file must be downloaded from the Biologging Intelligent Platform (BiP; https://www.bip-earth.com).
+There are two types of input files: a GPS file and an individual file. The individual file is available on "Input" file, while the GPS file must be downloaded from the Biologging Intelligent Platform (BiP; https://www.bip-earth.com).　
+A dummy GPS dataset (with fictional lon/lat values fitted to the actual data structure) can be obtained from the GPS folder. By formatting your data to match this structure, the code can be executed correctly.
 
 For HMM-based state classification, a large number of approaches were tested
 in pursuit of better classification accuracy, and the resulting code is
