@@ -1,0 +1,295 @@
+---
+title: "Data cleaning"
+author: "Serina"
+date: "2023-07-31"
+output: html_document
+---
+#library
+```{r}
+library(readr)
+library(geosphere)
+library(dplyr)
+library(ggplot2)
+library(gridExtra)
+library(grid)
+library(lme4)
+library(lmerTest)
+library(ggspatial)
+library(cowplot)
+library(rnaturalearth)
+library(ggmap)
+```
+
+#data
+```{r}
+rm(list=ls())
+csv_files <- list.files(path = "~/Documents/yodalab/data/final_data/", 
+                        pattern = "\\.csv$", full.names = TRUE)
+for (file in csv_files) {
+  var_name <- tools::file_path_sans_ext(basename(file))
+  assign(var_name, read_csv(file), envir = .GlobalEnv)
+}
+```
+
+#Cleaning1: make the state of the last row to "Homing"
+Now the last row is NA, so need to fix it to homing
+```{r}
+update_last_row_conditionally <- function(df) {
+  df %>%
+    group_by(ID) %>%
+    mutate(State = if_else(row_number() == n() & coast_distance >= 5000, "Fast_Homing", State)) %>%
+    ungroup()
+}
+GPS2013 <- update_last_row_conditionally(GPS2013)
+GPS2014 <- update_last_row_conditionally(GPS2014)
+GPS2015 <- update_last_row_conditionally(GPS2015)
+GPS2016 <- update_last_row_conditionally(GPS2016)
+GPS2017 <- update_last_row_conditionally(GPS2017)
+GPS2018 <- update_last_row_conditionally(GPS2018)
+GPS2019 <- update_last_row_conditionally(GPS2019)
+GPS2020 <- update_last_row_conditionally(GPS2020)
+GPS2021 <- update_last_row_conditionally(GPS2021)
+GPS2022 <- update_last_row_conditionally(GPS2022)
+```
+
+#Integrate all data to 1 dataframe
+```{r}
+all_data <- rbind(GPS2013, GPS2014, GPS2015, GPS2016, GPS2017, GPS2018, GPS2019, GPS2020, GPS2021, GPS2022)
+
+write_csv(all_data, "~/Documents/yodalab/data/final_data/all_state_data.csv")
+```
+
+
+#Cleaning1' adopt original_state for selected trips
+###############################################################################
+For reference only — do not run this code.
+###############################################################################
+
+In the actual data, HMM classification was performed both with and without coastal exclusion. The results with coastal exclusion were stored in the "State" column, and the results without coastal exclusion were stored in the "original_state" column.
+
+To improve accuracy, each trip was visually inspected. For trips where errors were observed (e.g., Searching segments mixed into Homing), and where the original_state classification (i.e., without coastal exclusion) was found to be more accurate, that classification was manually adopted instead.
+```{r}
+# List of Trip IDs to replace State with original_state
+# "2013_9A67016_12_trip","2014_9A79458_2_trip","2014_K14B89P_5_trip",
+# "2022_9B19815_43_trip","2022_9B14746_47_trip","2022_9B14746_48_trip",
+# "2019_9A58931_15_trip","2013_K13C40P_2_trip","2014_9A66707_11_trip"
+ids_to_replace <- c("2013_9A67016_12_trip","2014_9A79458_2_trip","2014_K14B89P_5_trip","2022_9B19815_43_trip","2022_9B14746_47_trip","2022_9B14746_48_trip","2019_9A58931_15_trip","2013_K13C40P_2_trip","2014_9A66707_11_trip")
+# Replace State with original_state for the listed IDs
+mask <- all_data$ID %in% ids_to_replace & !is.na(all_data$State)
+all_data$State[mask] <- all_data$original_state[mask]
+
+# List of Trip IDs to remove
+# "2022_9B00478_76_trip", "2013_K13C40P_5_trip"
+# These trips are excluded because their departure points are
+# located too far toward the upper or lower boundary of the study area.
+ids_to_remove <- c("2022_9B00478_76_trip", "2013_K13C40P_5_trip")
+# Remove rows belonging to the listed IDs
+all_data <- all_data[!all_data$ID %in% ids_to_remove, ]
+```
+
+#Visualize the trip
+```{r}
+plot_map_for_year <- function(out_place, year_list) {
+
+  my_palette <- c("cadetblue4", "yellowgreen", "#E69F00", "grey", "#0072B2", "#D55E00")
+  japan_map <- map_data("world", region = "Japan")
+  x_range <- c(141.1705, 143.0207)
+  y_range <- c(38.82596, 41.48974)
+
+  for (year in year_list) {
+    final_data <- get(year)
+    id_list <- unique(final_data$ID)
+    n_id <- length(id_list)
+
+    for(i in 1:n_id) {
+      data1 <- final_data %>%
+        filter(ID == id_list[i])
+
+      plot <- ggplot() +
+        geom_polygon(data = japan_map, aes(x = long, y = lat, group = group), fill = "white", color = "black") +
+        geom_point(data = data1, aes(x = lon, y = lat, colour = State), size = 1) +
+        geom_path(size = 1.5, alpha = 0.5, colour = "snow2") +
+        coord_cartesian(xlim = x_range, ylim = y_range) +
+        theme_bw() +
+        scale_color_manual(values = my_palette)
+
+      ggsave(file = paste0(out_place, "map", id_list[i], ".png"), plot = plot)
+    }
+  }
+}
+
+out_place <- "~/Documents/yodalab/data/middle_data/Added/No5_HMM_added_original/plot/"
+year_list <- list("GPS2013","GPS2014","GPS2015","GPS2016","GPS2017","GPS2018","GPS2019","GPS2020","GPS2021","GPS2022")
+plot_map_for_year(out_place, year_list)
+```
+
+#Cleaning2: Extract the homing data on sea, considering non-flight state
+When a "Slow" segment is interspersed within Homing, the bird is not flying, which causes inaccurate speed calculations.
+To address this, Homing_ID column is added to split Homing into separate segments when a Slow segment is interspersed, then only Homing data is extracted.
+```{r}
+# 1. For each ID, identify the first occurrence of Fast_Homing
+
+all_data <- all_data %>%
+  filter(!is.na(State))
+filtered_data <- all_data %>%
+  group_by(ID) %>%
+  filter(cumsum(State == "Fast_Homing") > 0)
+length(unique(filtered_data$ID))
+#[1] 1368
+
+# 2. Create a new HomingID column and assign a unique ID to each Homing segment
+
+homing_id <- rle(as.character(filtered_data$State))$lengths
+homing_id <- rep(seq_along(homing_id), homing_id)
+
+filtered_data <- filtered_data %>%
+  mutate(new_HomingID = ifelse(State == "Fast_Homing", 
+                               cumsum(State == "Fast_Homing" & lag(State, default="") != "Fast_Homing"), 
+                               NA_integer_)) %>%
+  mutate(HomingID = ifelse(!is.na(new_HomingID), 
+                           paste0(ID, "_", new_HomingID), 
+                           NA_character_)) %>%
+  dplyr::select(-new_HomingID)
+
+check <- filtered_data %>% 
+  dplyr::select(ID, State, HomingID)
+
+length(unique(filtered_data$HomingID))
+#[1] 1787
+
+# Remove unnecessary columns and rows where HomingID is NA
+filtered_data <- filtered_data %>%
+  filter(!is.na(HomingID))
+# Remove HomingIDs that contain only a single row
+filtered_data <- filtered_data %>%
+  group_by(HomingID) %>%
+  filter(!is.na(HomingID) & n() > 1) %>%
+  ungroup()
+
+all_homing_data <- filtered_data
+
+length(unique(all_homing_data$ID))
+#[1] 1296
+length(unique(filtered_data$HomingID))
+#[1] 1648
+```
+
+#Cleaning3:Remove the ID less than 5 points
+```{r}
+removed_IDs <- all_homing_data %>%
+  group_by(ID) %>%
+  filter(State == "Fast_Homing") %>% 
+  filter(n() <= 5) %>%
+  distinct(ID) %>%
+  pull(ID)
+
+cat("Removed IDs:", paste(removed_IDs, collapse = ", "), "\n")
+
+all_homing_data <- all_homing_data %>%
+  filter(!(ID %in% removed_IDs))
+length(unique(all_homing_data$ID))
+```
+#Output and read again
+```{r}
+write_csv(all_homing_data, "~/Documents/yodalab/data/final_data/all_sea_data.csv")
+
+rm(list=ls())
+all_sea_data <- read_csv("~/Documents/yodalab/data/final_data/all_sea_data.csv")
+```
+
+#visualize sea trip
+```{r}
+plot_map_for_year <- function(out_place, year_list) {
+
+  my_palette <- c("cadetblue4", "yellowgreen", "#E69F00", "grey", "#0072B2", "#D55E00")
+  japan_map <- map_data("world", region = "Japan")
+  x_range <- c(141.1705, 143.0207)
+  y_range <- c(38.82596, 41.48974)
+
+  for (year in year_list) {
+    final_data <- get(year)
+    id_list <- unique(final_data$ID)
+    n_id <- length(id_list)
+
+    for(i in 1:n_id) {
+      data1 <- final_data %>%
+        filter(ID == id_list[i])
+
+      plot <- ggplot() +
+        geom_polygon(data = japan_map, aes(x = long, y = lat, group = group), fill = "white", color = "black") +
+        geom_point(data = data1, aes(x = lon, y = lat), size = 1) +
+        geom_path(size = 1.5, alpha = 0.5, colour = "snow2") +
+        coord_cartesian(xlim = x_range, ylim = y_range) +
+        theme_bw() +
+        scale_color_manual(values = my_palette)
+
+      ggsave(file = paste0(out_place, "map", id_list[i], ".png"), plot = plot)
+    }
+  }
+}
+
+out_place <- "~/Documents/yodalab/data/middle_data/Added/No5_HMM_added_original/sea_plot/"
+year_list <- list("all_sea_data")
+plot_map_for_year(out_place, year_list)
+```
+
+#Cleaning4: remove the wierld trip manually
+```{r}
+################################################################################
+## Remove trips whose beeline from the departure point to the nest passes over land
+# "2013_9A67016_4_trip", "2022_9B00478_11_trip", "2022_9B04850_1_trip"
+## Remove the last point of trips where the bird is still flying at the final GPS point
+# "2022_9B07922_12_trip"
+################################################################################
+
+################################TO CHECK THE TRAJECTORY#########################
+  check <- all_sea_data %>% filter(ID == "2022_9B07922_12_trip") #Modify here
+  japan_map <- map_data("world", region = "Japan")
+  location_nest_data <- data.frame(lon = 141.5576031, lat = 40.5386062)
+  x_range <- c(141.1705, 143.0207)
+  y_range <- c(38.82596, 41.48974)
+  
+  ggplot() +
+        geom_polygon(data = japan_map, aes(x = long, y = lat, group = group), fill = "white", color = "black") +
+        geom_point(data = check, aes(x = lon, y = lat, colour = original_state), size = 1) +
+        geom_path(size = 1.5, alpha = 0.5, colour = "snow2") +
+        geom_point(data = location_nest_data, aes(x = lon, y = lat), color = "black", size = 2) +  # この行を追加
+        coord_cartesian(xlim = x_range, ylim = y_range) +
+        theme_classic() 
+################################################################################
+  
+# List of removing IDs
+exclude_ids <- c("2013_9A67016_4_trip", "2022_9B00478_11_trip", "2022_9B04850_1_trip")
+all_sea_data <- all_sea_data %>%
+  filter(!(ID %in% exclude_ids))
+
+#Remove the last point of 2022_9B07922_12_trip
+all_sea_data <- all_sea_data %>%
+  group_by(ID) %>%
+  mutate(row_number = row_number()) %>%
+  filter(!(ID == "2022_9B07922_12_trip" & row_number == max(row_number))) %>%
+  dplyr::select(-row_number)
+
+######################################################################
+#Remove the exceptionaly long trip
+#2015_9A32131_5_trip
+######################################################################
+
+exclude_ids <- c("2015_9A32131_5_trip")
+
+all_sea_data <- all_sea_data %>%
+  filter(!(ID %in% exclude_ids))
+
+write_csv(all_sea_data, "~/Documents/yodalab/data/final_data/all_sea_data.csv")
+```
+
+#visualize sea trip
+```{r}
+# Empty the output directory before saving new plots
+out_place <- "~/Documents/yodalab/data/middle_data/Added/No5_HMM_added_original/sea_plot/"
+file.remove(list.files(out_place, full.names = TRUE))
+
+year_list <- list("all_sea_data")
+plot_map_for_year(out_place, year_list)
+```
+
