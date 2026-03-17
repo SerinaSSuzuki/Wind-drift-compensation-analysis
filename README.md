@@ -11,3 +11,5 @@ base code, then manually adjusting the parameters for each individual while
 inspecting the output figures, until the optimal classification was achieved.
 The GPS tracking plots generated from the final state classification are
 provided in the file: GPS tracking plot.
+
+This code contains two separate sections for adding wind data columns, but only one of them actually needed (I left it for recording purpose). For a detailed explanation of the wind matching process, refer to code 4.
