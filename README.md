@@ -4,7 +4,7 @@ Full code for cleaning GPS data acquired from GiPSy, Axy-Trek, and Pinpoint VHF 
 Code1 is only for cleaing our dataset, so you can skip it when you are using your dataset.
 
 There are two types of input files: a GPS file and an individual file. The individual file is available on "Input" file, while the GPS file must be downloaded from the Biologging Intelligent Platform (BiP; https://www.bip-earth.com).　
-A dummy GPS dataset (with fictional lon/lat values fitted to the actual data structure) can be obtained from the GPS folder. By formatting your data to match this structure, the code can be executed correctly. Skip Code1 if you are using this dataset.
+A dummy GPS dataset (with fictional lon/lat values fitted to the actual data structure) can be obtained from the GPS folder. By formatting your data to match this structure, the code can be executed correctly.
 
 For HMM-based state classification, a large number of approaches were tested
 in pursuit of better classification accuracy, and the resulting code is
