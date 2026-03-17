@@ -1,0 +1,330 @@
+---
+title: "Wind"
+output: html_document
+date: "2025-01-10"
+---
+In previous code (Code4 Wind), I used the function match_wind: Matches each GPS point to the single nearest ERA5 grid point in space and time. Simple and fast, but less accurate.
+
+In here, I used conv_wind2: Applies inverse-distance-weighted interpolation across the four surrounding ERA5 grid points, with temporal interpolation between the two nearest time steps. Slower but more accurate.
+
+#library
+```{r}
+library(dplyr)
+library(lubridate)
+library(ncdf4)
+library(tidyverse)
+library(geosphere)
+library(rnaturalearth)
+library(sf)
+library(ggspatial)
+```
+
+#data
+```{r}
+rm(list=ls())
+sea_data <- read_csv("~/Documents/yodalab/data/final_data/all_sea_data.csv")
+```
+
+
+#Check the range of GPS and wind
+```{r}
+check_data_range <- function(data, target_year, wind_dir = "~/Documents/yodalab/data/wind/") {
+  wind_file <- paste0(wind_dir, "wind_", target_year, ".nc")
+  nc_data <- nc_open(wind_file)
+  
+  wind_time <- as.POSIXct(ncvar_get(nc_data, "valid_time"), origin="1970-01-01", tz="UTC")
+  wind_lon <- ncvar_get(nc_data, "longitude")
+  wind_lat <- ncvar_get(nc_data, "latitude")
+
+  cat(sprintf("\n%d year wind data：\n", target_year))
+  cat("time range：", format(min(wind_time)), "to", format(max(wind_time)), "\n")
+  cat("lon range：", min(wind_lon), "to", max(wind_lon), "\n")
+  cat("lat range：", min(wind_lat), "to", max(wind_lat), "\n")
+  
+  track_year <- data %>% 
+    filter(year == target_year)
+  
+  cat(sprintf("\n%d year tracking data：\n", target_year))
+  if (nrow(track_year) > 0) {
+    cat("time range：", format(min(track_year$time)), "to", format(max(track_year$time)), "\n")
+    cat("lon range：", min(track_year$lon), "to", max(track_year$lon), "\n")
+    cat("lat range：", min(track_year$lat), "to", max(track_year$lat), "\n")
+    cat("data point：", nrow(track_year), "\n")
+  } else {
+    cat("no tracking data\n")
+  }
+  nc_close(nc_data)
+  return(list(
+    wind = list(
+      time_range = range(wind_time),
+      lon_range = range(wind_lon),
+      lat_range = range(wind_lat)
+    ),
+    track = if(nrow(track_year) > 0) list(
+      time_range = range(track_year$time),
+      lon_range = range(track_year$lon),
+      lat_range = range(track_year$lat),
+      n_points = nrow(track_year)
+    ) else NULL
+  ))
+}
+
+years_to_check <- 2013:2022
+for(year in years_to_check) {
+  tryCatch({
+    check_data_range(sea_data, year)
+  }, error = function(e) {
+    cat(sprintf("\n%dyear error：%s\n", year, e$message))
+  })
+}
+
+```
+
+#Add wind
+Wind is interpolated to each GPS point using inverse distance weighting
+across the 4 surrounding ERA5 grid points (spatial) and the 2 bracketing time steps (temporal), giving a more accurate estimate than nearest-neighbor matching.
+```{r}
+# # Remove ERA5 wind columns from sea_data
+# sea_data <- sea_data %>%
+#   dplyr::select(-ERA5_wind_east, -ERA5_wind_north)
+
+conv_wind2 <- function(nc_data, data_time, data_lon, data_lat) {
+ if (!identical(attr(data_time, "tzone"), "UTC")) {
+   warning("Input data_time is not in UTC. Converting to UTC...")
+   data_time <- with_tz(data_time, "UTC")
+ }
+ 
+ lon <- ncdf4::ncvar_get(nc_data, "longitude")
+ lat <- ncdf4::ncvar_get(nc_data, "latitude")
+ time <- ncdf4::ncvar_get(nc_data, "valid_time")
+ time_obs <- as.POSIXct(time, origin="1970-01-01", tz="UTC")
+ 
+ cat(sprintf("Data time range: %s to %s (UTC)\n", 
+             min(data_time), max(data_time)))
+ cat(sprintf("NC file time range: %s to %s (UTC)\n", 
+             min(time_obs), max(time_obs)))
+ 
+ if (
+   (min(data_time, na.rm = TRUE) < min(time_obs, na.rm = TRUE)) ||
+   (max(time_obs, na.rm = TRUE) < max(data_time, na.rm = TRUE)) ||
+   (min(data_lon, na.rm = TRUE) < min(lon, na.rm = TRUE)) ||
+   (max(lon, na.rm = TRUE) < max(data_lon, na.rm = TRUE)) ||
+   (min(data_lat, na.rm = TRUE) < min(lat, na.rm = TRUE)) ||
+   (max(lat) < max(data_lat, na.rm = TRUE))
+ ) {
+   print("The track data include data points that are outside the spatiotemporal range of the input environmental data.")
+   return(NA)
+ }
+ 
+ u <- ncdf4::ncvar_get(nc_data, "u10")
+ v <- ncdf4::ncvar_get(nc_data, "v10")
+ 
+ n_lat <- length(lat)
+ n_lon <- length(lon)
+ n <- length(data_time)
+ 
+ ERA5_wind_east <- rep(NA, n)
+ ERA5_wind_north <- rep(NA, n)
+ 
+ Time_low <- rep(as.POSIXct(NA), n)
+ Time_up <- rep(as.POSIXct(NA), n)
+ Lat_low <- rep(NA, n)
+ Lat_up <- rep(NA, n)
+ Lon_low <- rep(NA, n)
+ Lon_up <- rep(NA, n)
+ 
+ pb <- txtProgressBar(min = 0, max = n, style = 3)
+ 
+ for(i in 1:n) {
+   setTxtProgressBar(pb, i)
+   
+   diff_vector <- lat - data_lat[i]
+   lat_up_id <- which(diff_vector == min(diff_vector[diff_vector >= 0]))
+   lat_low_id <- which(diff_vector == max(diff_vector[diff_vector < 0]))
+   
+   diff_vector <- lon - data_lon[i]
+   lon_up_id <- which(diff_vector == min(diff_vector[diff_vector >= 0]))
+   lon_low_id <- which(diff_vector == max(diff_vector[diff_vector < 0]))
+   
+   diff_vector <- as.numeric(time_obs - data_time[i])
+   t_up_id <- which(diff_vector == min(diff_vector[diff_vector >= 0]))
+   t_low_id <- which(diff_vector == max(diff_vector[diff_vector < 0]))
+   
+   Lat_up[i] <- lat[lat_up_id]
+   Lat_low[i] <- lat[lat_low_id]
+   Lon_up[i] <- lon[lon_up_id]
+   Lon_low[i] <- lon[lon_low_id]
+   Time_up[i] <- time_obs[t_up_id]
+   Time_low[i] <- time_obs[t_low_id]
+   
+   d1 <- geosphere::distHaversine(c(data_lon[i], data_lat[i]),
+                                c(Lon_low[i], Lat_up[i])) / 1000
+   d2 <- geosphere::distHaversine(c(data_lon[i], data_lat[i]),
+                                c(Lon_up[i], Lat_up[i])) / 1000
+   d3 <- geosphere::distHaversine(c(data_lon[i], data_lat[i]),
+                                c(Lon_low[i], Lat_low[i])) / 1000
+   d4 <- geosphere::distHaversine(c(data_lon[i], data_lat[i]),
+                                c(Lon_up[i], Lat_low[i])) / 1000
+   
+   ta <- as.numeric(data_time[i] - Time_low[i], units="hours")
+   tb <- as.numeric(Time_up[i] - data_time[i], units="hours")
+   
+   calculate_spatial_interpolation <- function(u_or_v, d1, d2, d3, d4,
+                                            lon_low_id, lon_up_id,
+                                            lat_low_id, lat_up_id, time_id) {
+     value_1 <- u_or_v[lon_low_id, lat_up_id, time_id]
+     value_2 <- u_or_v[lon_up_id, lat_up_id, time_id]
+     value_3 <- u_or_v[lon_low_id, lat_low_id, time_id]
+     value_4 <- u_or_v[lon_up_id, lat_low_id, time_id]
+     
+     inverse_distance_weighted_mean <- (
+       1/d1*value_1 + 1/d2*value_2 + 1/d3*value_3 + 1/d4*value_4
+     ) / (1/d1 + 1/d2 + 1/d3 + 1/d4)
+     
+     return(inverse_distance_weighted_mean)
+   }
+   
+   calculate_temporal_interpolation <- function(a, b, ta, tb) {
+     if (ta == 0) {
+       return(a)
+     } else if (tb == 0) {
+       return(b)
+     } else {
+       return((1/ta * a + 1/tb * b) / (1/ta + 1/tb))
+     }
+   }
+   
+   ERA5_wind_east_a_inv_mean <- calculate_spatial_interpolation(
+     u, d1, d2, d3, d4, lon_low_id, lon_up_id, lat_low_id, lat_up_id, t_low_id
+   )
+   ERA5_wind_east_b_inv_mean <- calculate_spatial_interpolation(
+     u, d1, d2, d3, d4, lon_low_id, lon_up_id, lat_low_id, lat_up_id, t_up_id
+   )
+   ERA5_wind_east[i] <- calculate_temporal_interpolation(
+     ERA5_wind_east_a_inv_mean, ERA5_wind_east_b_inv_mean, ta, tb
+   )
+   
+   ERA5_wind_north_a_inv_mean <- calculate_spatial_interpolation(
+     v, d1, d2, d3, d4, lon_low_id, lon_up_id, lat_low_id, lat_up_id, t_low_id
+   )
+   ERA5_wind_north_b_inv_mean <- calculate_spatial_interpolation(
+     v, d1, d2, d3, d4, lon_low_id, lon_up_id, lat_low_id, lat_up_id, t_up_id
+   )
+   ERA5_wind_north[i] <- calculate_temporal_interpolation(
+     ERA5_wind_north_a_inv_mean, ERA5_wind_north_b_inv_mean, ta, tb
+   )
+ }
+ 
+ close(pb)
+ 
+ result <- data.frame(ERA5_wind_east, ERA5_wind_north)
+ return(result)
+}
+
+process_wind_data <- function(data, wind_dir = "~/Documents/yodalab/data/wind/") {
+ if (!identical(attr(data$time, "tzone"), "UTC")) {
+   warning("Input data time is not in UTC. Converting to UTC...")
+   data$time <- with_tz(data$time, "UTC")
+ }
+ 
+ data_by_year <- data %>%
+   group_by(year) %>%
+   group_split()
+ 
+ results_list <- list()
+ 
+ for (year_data in data_by_year) {
+   current_year <- unique(year_data$year)
+   cat(sprintf("Processing year %d...\n", current_year))
+   
+   wind_file <- paste0(wind_dir, "wind_", current_year, ".nc")
+   
+   nc_data <- ncdf4::nc_open(wind_file)
+   
+   wind_result <- conv_wind2(
+     nc_data = nc_data,
+     data_time = year_data$time,
+     data_lon = year_data$lon,
+     data_lat = year_data$lat
+   )
+   
+   if (!all(is.na(wind_result))) {
+     year_result <- cbind(year_data, wind_result)
+     
+     results_list[[as.character(current_year)]] <- year_result
+   }
+   
+   ncdf4::nc_close(nc_data)
+ }
+ 
+ final_result <- bind_rows(results_list)
+ return(final_result)
+}
+
+cat("Checking timezone of input data:\n")
+cat("sea_data timezone:", attr(sea_data$time, "tzone"), "\n")
+
+sea_data_with_wind <- process_wind_data(sea_data)
+```
+
+#Calculate backwind, crosswind,α
+Reference: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC7661306/
+```{r}
+data_all <- sea_data_with_wind
+
+data_out <- tibble()
+ids <- unique(data_all$HomingID)
+nest_lon <- 141.5576031
+nest_lat <- 40.5386062
+
+deg2rad <- function(deg) {
+  return(deg * pi / 180)
+}
+
+for (selectid in ids) {
+  data <- filter(data_all, HomingID == selectid)
+
+# Compute the direction to the nest
+  data <- data %>%
+    mutate(direction_to_nest = bearing(cbind(lon, lat), c(nest_lon, nest_lat)))
+
+# Compute the direction of movement
+  data <- data %>%
+    mutate(direction_of_movement = bearing(cbind(lon, lat), cbind(lead(lon), lead(lat))))
+  
+# Compute α
+data <- data %>%
+  mutate(
+    α = direction_of_movement - direction_to_nest
+  )
+
+data <- data %>%
+  mutate(
+    α = ifelse(α > 180, α - 360, ifelse(α < -180, α + 360, α))
+  )
+    
+data <- data %>%
+  mutate(
+    direction_to_nest = ifelse(direction_to_nest < 0, direction_to_nest + 360, direction_to_nest),
+    direction_of_movement = ifelse(direction_of_movement < 0, direction_of_movement + 360, direction_of_movement)
+  )
+
+data <- data %>%
+  rename(
+    Wx = ERA5_wind_east,
+    Wy = ERA5_wind_north
+  )
+
+  data <- data %>%
+    mutate(
+      nx = sin(deg2rad(direction_to_nest)), # Unit vector toward the nest (east component)
+      ny = cos(deg2rad(direction_to_nest)), # Unit vector toward the nest (north component)
+      wind_back = Wx * nx + Wy * ny,  # Tailwind component along the beeline to the nest
+      wind_cross = Wx * ny - Wy * nx   # Crosswind component perpendicular to the beeline
+    )
+  
+  data_out <- data_out %>% bind_rows(data)
+}
+
+write_csv(data_out, "~/Documents/yodalab/data/final_data/all_sea_data_wind.csv")
+```
