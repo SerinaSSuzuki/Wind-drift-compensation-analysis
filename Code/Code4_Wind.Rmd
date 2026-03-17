@@ -1,0 +1,158 @@
+---
+title: "New4_Wind"
+author: "Serina"
+date: "2023-07-28"
+output: html_document
+---
+Caution: Kept for formatting purposes; in practice, wind columns are removed and re-added after HMM fitting
+Wind data is from ERA5α: https://cds.climate.copernicus.eu/datasets/reanalysis-era5-single-levels?tab=download
+
+#library
+```{r}
+rm(list=ls())
+library(ncdf4)
+library(tidyverse)
+library(ggplot2)
+library(geosphere)
+library(gridExtra)
+```
+
+#data
+```{r}
+rm(list=ls())
+csv_files <- list.files(path = "~/Documents/yodalab/data/middle_data/Added/No3_5min_resampled/fixed/", 
+                        pattern = "\\.csv$", full.names = TRUE)
+for (file in csv_files) {
+  var_name <- tools::file_path_sans_ext(basename(file))
+  assign(var_name, read_csv(file), envir = .GlobalEnv)
+}
+```
+
+#chack the range of longitude/latitude
+Download the wind data based on this range
+```{r}
+dataframes <- c("GPS2013","GPS2014","GPS2015","GPS2016","GPS2017","GPS2018","GPS2019","GPS2020","GPS2021","GPS2022")
+result <- data.frame(Year = character(), LonMin = numeric(), LonMax = numeric(), LatMin = numeric(), LatMax = numeric(), TimeMin = character(), TimeMax = character())
+for(df_name in dataframes) {
+  df <- get(df_name)
+  lon_min <- min(df$lon, na.rm = TRUE)
+  lon_max <- max(df$lon, na.rm = TRUE)
+  lat_min <- min(df$lat, na.rm = TRUE)
+  lat_max <- max(df$lat, na.rm = TRUE)
+
+  time_min <- min(df$time, na.rm = TRUE)
+  time_max <- max(df$time, na.rm = TRUE)
+
+  result <- rbind(result, data.frame(Year = df_name, LonMin = lon_min, LonMax = lon_max, LatMin = lat_min, LatMax = lat_max, TimeMin = as.character(time_min), TimeMax = as.character(time_max)))
+}
+print(result)
+```
+
+#Define the function match_wind
+ A custom function to match ERA5 wind data to GPS tracking data based on time and location
+
+ Arguments:
+   nc_data    : NetCDF data containing ERA5 wind fields
+   data_time  : Timestamp of the GPS data point
+   data_lon   : Longitude of the GPS data point
+   data_lat   : Latitude of the GPS data point
+
+ For each GPS data point, the function selects the ERA5 grid point that is closest in time, longitude, and latitude, and returns a data frame with:
+   ERA5_wind_east    : Eastward wind component at the selected ERA5 grid point
+   ERA5_wind_north   : Northward wind component at the selected ERA5 grid point
+   Time_diff_in_hours: Time difference between the GPS point and the matched ERA5 data
+   Distance_in_km    : Spatial distance between the GPS point and the matched ERA5 grid point
+```{r}
+match_wind <- function(nc_data,data_time,data_lon,data_lat){
+  lon  <- ncvar_get(nc_data,"longitude")
+  lat  <- ncvar_get(nc_data,"latitude")
+
+  #time in ERA5 data is "hours since 1900-01-01 00:00:00.0", so need to convert to POSIXct
+  #If you want to check, you can use the code below
+  #tunits <- ncatt_get(nc_data,"time","units")
+  
+  #(For old format)
+  #time <- ncvar_get(nc_data,"time")
+  #For new format
+  time <- ncvar_get(nc_data,"valid_time")
+  
+
+  #(For old format) 
+  # Time unit was "hours since 1900-01-01" (POSIX origin), so need to change second
+  #time_obs <-as.POSIXct(time*3600,origin="1900-01-01 00:00:00",tz="GMT")
+  #For new format
+  # Time unit is "seconds since 1970-01-01" (POSIX origin), so no multiplication needed
+  time_obs <- as.POSIXct(time, origin = "1970-01-01 00:00:00", tz = "GMT")
+  
+  
+  #If you use the data other than ERA5, need to check the unit and convert time_obs by different manner
+  
+  #Eastward portion of wind vector (u10) and northward portion (v10)
+  u <- ncvar_get(nc_data,"u10")
+  v <- ncvar_get(nc_data,"v10")
+  
+  #convert missing data to NA
+  fillvalue_u <- ncatt_get(nc_data,"u10","_FillValue")
+  fillvalue_v <- ncatt_get(nc_data,"v10","_FillValue")
+  u[u==fillvalue_u$value] <- NA
+  v[v==fillvalue_v$value] <- NA
+  
+  
+  # Define a function that returns the index of the element in vector y
+  # closest to x_elem
+find_closest_position <- function(x_elem, y) {
+  differences <- abs(y - x_elem)
+  return(which.min(differences))
+}
+# Find the index of the closest time in ERA5 for each observation time
+   time_id <- sapply(data_time, find_closest_position, y = time_obs)
+# Find the index of the closest longitude in ERA5 for each observation longitude
+  lon_id  <- sapply(data_lon, find_closest_position, y = lon)
+ # Find the index of the closest latitude in ERA5 for each observation latitude
+  lat_id  <- sapply(data_lat, find_closest_position, y = lat)
+#Chose the optimal point
+  n <- length(time_id)
+  ERA5_wind_east     <- rep(NA,n)
+  ERA5_wind_north    <- rep(NA,n)
+  Time_diff_in_hours <- rep(NA,n)
+  Distance_in_km     <- rep(NA,n)
+  
+  for(i in 1:n){
+    ERA5_wind_east[i]  <- u[lon_id[i], lat_id[i], time_id[i]]
+    ERA5_wind_north[i] <- v[lon_id[i], lat_id[i], time_id[i]]
+  Time_diff_in_hours[i] <- as.numeric(time_obs[time_id[i]] - data_time[i],unit="hours")
+  Distance_in_km[i] <- geosphere::distGeo(c(data_lon[i],data_lat[i]),c(lon[lon_id[i]],lat[lat_id[i]]))/1000
+  } 
+  
+  return(data.frame(ERA5_wind_east, 
+                    ERA5_wind_north,
+                    Time_diff_in_hours,
+                    Distance_in_km
+                    )
+         )
+  
+}
+```
+
+#Add wind
+```{r}
+file_path <- "~/Documents/yodalab/data/middle_data/Added/No4_wind_added/"
+data_latlon <- list(GPS2013, GPS2014, GPS2015, GPS2016, GPS2017, GPS2018, GPS2019, GPS2020, GPS2021, GPS2022)
+
+file_names <- paste0("wind_",2013:2022, ".nc")
+
+for (i in seq_along(file_names)) {
+  
+  nc_data <- nc_open(file.path("~/Documents/yodalab/data/wind", file_names[i]))
+  
+  # matchwind
+  wind_ERA5 <- match_wind(nc_data,
+                          data_time = data_latlon[[i]]$time,
+                          data_lon = data_latlon[[i]]$lon,
+                          data_lat = data_latlon[[i]]$lat)
+  
+  wind_data <- cbind(data_latlon[[i]], wind_ERA5)
+  output_file <- paste0(file_path, "wind_data_", 2013+i-1, ".csv")
+  write.csv(wind_data, output_file, row.names = FALSE)
+}
+```
