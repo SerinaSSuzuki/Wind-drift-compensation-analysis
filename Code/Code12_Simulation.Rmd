@@ -1,0 +1,855 @@
+#library
+```{r}
+library(deSolve)
+library(ggplot2)
+library(dplyr)
+library(gridExtra)
+```
+
+
+#Define the starting angle
+Find optimal initial angles for each wind condition and verify results with trajectory plots
+angle_deg = offset from 180 deg (= 180 - actual angle)
+```{r}
+# Parameters ---------------------------------------
+
+# Bird airspeed [m/s]
+Va <- 8
+
+# Wind conditions to search
+wind_strengths <- c(1.5e-4, 2.5e-4, 3.5e-4, 4.5e-4, 5.5e-4, 6.5e-4, 7.5e-4)
+
+# Reference angles from Block 2 (for comparison)
+# angle_deg here = offset from 180 deg (e.g. 8.800 means pi - pi/180 * 8.800)
+known_angles_ref <- data.frame(
+  wind_strength = c(2.5e-4, 3.5e-4, 4.5e-4, 5.5e-4, 6.5e-4, 7.5e-4),
+  angle_deg     = c(8.800, 12.020, 15.020, 17.720, 20.000, 21.820)
+)
+
+# Angle search range (offset from 180 deg)
+angle_search_config <- list(
+  coarse_range     = c(1,  40),
+  coarse_step      = 1,
+  fine_range       = c(3,  30),
+  fine_step        = 0.1,
+  ultra_fine_range = c(5,  25),
+  ultra_fine_step  = 0.02
+)
+
+# ODE simulation settings
+simulation_config <- list(
+  max_time  = 5000,
+  time_step = 2
+)
+
+# ODE Function -------------------------------------
+
+# Differential equations for bird flight under wind
+# State : x [m], y [altitude m], theta [rad, from y-axis clockwise]
+# Params: Va [airspeed m/s], W [wind coefficient]
+bird_ode <- function(t, state, parameters) {
+  with(as.list(c(state, parameters)), {
+    dx     <- Va * sin(state[3]) - W * state[2]
+    dy     <- Va * cos(state[3])
+    dtheta <- -W * sin(state[3])^2
+    return(list(c(dx, dy, dtheta)))
+  })
+}
+
+# Trajectory Calculation ---------------------------
+
+# Compute full trajectory data frame for a given angle and wind strength
+# Returns the entire sol_df for plotting, plus landing info
+calc_trajectory_full <- function(angle_rad, wind_strength) {
+  params <- c(Va = Va, W = wind_strength)
+  state0 <- c(x = 0, y = 10000, theta = angle_rad)
+  times  <- seq(0, simulation_config$max_time, by = simulation_config$time_step)
+
+  tryCatch({
+    sol    <- ode(y = state0, times = times,
+                  func = bird_ode, parms = params, method = "lsoda")
+    sol_df <- as.data.frame(sol)
+    colnames(sol_df) <- c("time", "x", "y", "theta")
+
+    # Clip trajectory at ground level (y = 0)
+    ground_idx <- which(sol_df$y <= 0)
+
+    if (length(ground_idx) > 0) {
+      idx <- min(ground_idx)
+
+      # Linear interpolation for accurate landing x
+      if (idx > 1) {
+        ratio   <- sol_df$y[idx - 1] / (sol_df$y[idx - 1] - sol_df$y[idx])
+        final_x <- sol_df$x[idx - 1] + ratio * (sol_df$x[idx] - sol_df$x[idx - 1])
+      } else {
+        final_x <- sol_df$x[idx]
+      }
+
+      # Clip trajectory at landing point
+      sol_df <- sol_df[1:idx, ]
+      sol_df$y[idx] <- 0
+      sol_df$x[idx] <- final_x
+
+      return(list(
+        success            = TRUE,
+        reaches_ground     = TRUE,
+        distance_to_origin = abs(final_x),
+        # Offset from 180 deg → matches Block 2 known_angles convention
+        angle_deg          = 180 - angle_rad * 180 / pi,
+        trajectory         = sol_df
+      ))
+
+    } else {
+      return(list(
+        success            = TRUE,
+        reaches_ground     = FALSE,
+        distance_to_origin = Inf,
+        angle_deg          = 180 - angle_rad * 180 / pi,
+        trajectory         = sol_df
+      ))
+    }
+
+  }, error = function(e) {
+    return(list(success = FALSE, reaches_ground = FALSE,
+                distance_to_origin = Inf, angle_deg = NA, trajectory = NULL))
+  })
+}
+
+# Angle Search -------------------------------------
+
+# Find the optimal initial angle for a given wind strength
+# Returns a list with best result (including full trajectory for plotting)
+find_optimal_angle <- function(wind_strength) {
+  cat("Searching... W =", wind_strength, "\n")
+
+  # Build offset array from all three search stages
+  offsets_all <- sort(unique(c(
+    seq(angle_search_config$coarse_range[1],
+        angle_search_config$coarse_range[2],
+        by = angle_search_config$coarse_step),
+    seq(angle_search_config$fine_range[1],
+        angle_search_config$fine_range[2],
+        by = angle_search_config$fine_step),
+    seq(angle_search_config$ultra_fine_range[1],
+        angle_search_config$ultra_fine_range[2],
+        by = angle_search_config$ultra_fine_step)
+  )))
+
+  # Convert offsets to radians
+  angles_rad <- pi - offsets_all * pi / 180
+
+  # Evaluate every candidate angle
+  results <- lapply(angles_rad, function(a) calc_trajectory_full(a, wind_strength))
+
+  # Keep only ground-reaching trajectories
+  ground_results <- Filter(function(r) r$success && r$reaches_ground, results)
+
+  if (length(ground_results) == 0) {
+    cat("  WARNING: No ground-reaching trajectory found.\n\n")
+    return(NULL)
+  }
+
+  # Select best angle (minimum landing distance)
+  best_idx <- which.min(sapply(ground_results, `[[`, "distance_to_origin"))
+  best     <- ground_results[[best_idx]]
+
+  cat(sprintf("  Best angle (offset from 180): %.3f deg  |  dist: %.1f m\n\n",
+              best$angle_deg, best$distance_to_origin))
+
+  return(list(
+    wind_strength = wind_strength,
+    angle_deg     = best$angle_deg,
+    dist_m        = best$distance_to_origin,
+    trajectory    = best$trajectory
+  ))
+}
+
+# Main Execution -----------------------------------
+
+cat("=== Searching optimal angles for all wind conditions ===\n\n")
+
+# Run search for each wind condition
+results_list <- lapply(wind_strengths, find_optimal_angle)
+results_list <- Filter(Negate(is.null), results_list)
+
+# Build known_angles data frame
+known_angles <- data.frame(
+  wind_strength = sapply(results_list, `[[`, "wind_strength"),
+  angle_deg     = sapply(results_list, `[[`, "angle_deg"),
+  dist_m        = sapply(results_list, `[[`, "dist_m")
+)
+
+# Print summary
+cat("=== Result Summary ===\n")
+print(known_angles)
+
+# Compare with reference angles (Block 2)
+cat("\n=== Comparison with Block 2 reference angles ===\n")
+merged <- merge(known_angles, known_angles_ref,
+                by = "wind_strength", suffixes = c("_found", "_ref"))
+# Difference between found and reference offsets
+merged$diff <- round(merged$angle_deg_found - merged$angle_deg_ref, 3)
+print(merged[, c("wind_strength", "angle_deg_found", "angle_deg_ref", "diff")])
+
+# Print copy-paste output for Block 2
+cat("\n=== Paste this into Block 2 ===\n")
+cat("known_angles <- data.frame(\n")
+cat("  wind_strength = c(",
+    paste(known_angles$wind_strength, collapse = ", "), "),\n")
+cat("  angle_deg     = c(",
+    paste(round(known_angles$angle_deg, 3), collapse = ", "), ")\n")
+cat(")\n")
+
+# Trajectory Plot ----------------------------------
+
+cat("\n=== Generating trajectory plot ===\n")
+
+# Combine all optimal trajectories into one data frame
+all_traj <- do.call(rbind, lapply(results_list, function(r) {
+  df            <- r$trajectory
+  # Label each trajectory by wind condition
+  df$wind_label <- sprintf("W = %.1e", r$wind_strength)
+  df$angle_label <- sprintf("offset = %.3f deg", r$angle_deg)
+  df$dist_label  <- sprintf("dist = %.1f m", r$dist_m)
+  return(df)
+}))
+
+# Plot
+traj_plot <- ggplot() +
+  # Trajectory paths
+  geom_path(data = all_traj,
+            aes(x = x, y = y, color = wind_label),
+            linewidth = 1.2) +
+  # 1-minute interval dots (every 60 s)
+  geom_point(data = all_traj %>% filter(time %% 60 < 2),
+             aes(x = x, y = y, color = wind_label),
+             size = 2, alpha = 0.7) +
+  # Release point (start)
+  geom_point(data = data.frame(x = 0, y = 10000),
+             aes(x = x, y = y),
+             color = "black", size = 5, shape = 17) +
+  # Target point (origin on ground)
+  geom_point(data = data.frame(x = 0, y = 0),
+             aes(x = x, y = y),
+             color = "red", size = 5, shape = 16) +
+  coord_fixed(ratio = 1) +
+  scale_x_continuous(limits = c(-9000, 2000)) +
+  scale_y_continuous(limits = c(-500, 11000)) +
+  scale_color_discrete(name = "Wind Strength") +
+  theme_classic() +
+  labs(
+    title    = "Optimal Trajectories",
+    subtitle = "Triangle = start, Red circle = target origin",
+    x        = "x [m]",
+    y        = "y [m]"
+  ) +
+  theme(
+    text            = element_text(size = 12, family = "Arial"),
+    legend.position = "bottom"
+  )
+
+traj_plot
+```
+
+#Detailed Initial Angle Search
+Refine known_angles using wind-adaptive search ranges
+```{r}
+# Parameters --------------------------------------------------
+
+Va <- 8
+
+wind_strengths <- c(1.5e-4, 2.5e-4, 3.5e-4, 4.5e-4, 5.5e-4, 6.5e-4, 7.5e-4)
+
+simulation_config <- list(max_time = 8000, time_step = 1)
+
+# Adaptive search lookup table
+# All angle values = offset from 180 deg (e.g. 8.760 = pi - pi/180 * 8.760)
+search_table <- data.frame(
+  max_w   = c(1.5e-4, 2.5e-4, 3.5e-4, 4.5e-4, 5.5e-4, 6.5e-4,  Inf),
+  c_lo    = c(   0.0,    0.0,    5.0,    8.0,   12.0,   15.0,  18.0),
+  c_hi    = c(  12.0,   15.0,   18.0,   22.0,   25.0,   28.0,  30.0),
+  c_step  = c(   0.2,    0.3,    0.4,    0.5,    0.5,    0.5,   0.5),
+  f_lo    = c(   3.0,    5.0,    9.0,   12.0,   15.0,   17.0,  20.0),
+  f_hi    = c(  10.0,   12.0,   15.0,   18.0,   21.0,   23.0,  25.0),
+  f_step  = rep(0.05, 7),
+  uf_lo   = c(   4.0,    7.0,   11.0,   14.0,   16.5,   19.0,  21.0),
+  uf_hi   = c(   7.0,   11.0,   13.0,   16.0,   19.0,   21.0,  23.0),
+  uf_step = rep(0.01, 7)
+)
+
+# Functions ---------------------------------------------------
+
+get_search_config <- function(wind_coeff) {
+  search_table[which(wind_coeff <= search_table$max_w)[1], ]
+}
+
+bird_ode <- function(t, state, parameters) {
+  with(as.list(c(state, parameters)), {
+    return(list(c(
+      Va * sin(state[3]) - W * state[2],
+      Va * cos(state[3]),
+      -W * sin(state[3])^2
+    )))
+  })
+}
+
+# Simulate one trajectory
+# Returns landing distance, angle offset, and full trajectory data frame
+calc_trajectory <- function(angle_rad, wind_strength) {
+  params <- c(Va = Va, W = wind_strength)
+  state0 <- c(x = 0, y = 10000, theta = angle_rad)
+  times  <- seq(0, simulation_config$max_time, by = simulation_config$time_step)
+
+  tryCatch({
+    sol <- as.data.frame(ode(y = state0, times = times,
+                             func = bird_ode, parms = params,
+                             method = "lsoda"))
+    colnames(sol) <- c("time", "x", "y", "theta")
+
+    idx <- which(sol$y <= 0)
+    if (length(idx) > 0) {
+      i       <- min(idx)
+      ratio   <- sol$y[i-1] / (sol$y[i-1] - sol$y[i])
+      final_x <- sol$x[i-1] + ratio * (sol$x[i] - sol$x[i-1])
+      # Clip trajectory at landing point
+      sol$x[i] <- final_x
+      sol$y[i] <- 0
+      return(list(reaches_ground = TRUE,
+                  distance       = abs(final_x),
+                  offset_deg     = 180 - angle_rad * 180 / pi,
+                  trajectory     = sol[1:i, ]))
+    } else {
+      return(list(reaches_ground = FALSE, distance = Inf,
+                  offset_deg = 180 - angle_rad * 180 / pi,
+                  trajectory = sol))
+    }
+  }, error = function(e) {
+    return(list(reaches_ground = FALSE, distance = Inf,
+                offset_deg = NA, trajectory = NULL))
+  })
+}
+
+# Find best initial angle; return summary row and best trajectory
+find_optimal_angle <- function(wind_strength) {
+  cfg     <- get_search_config(wind_strength)
+  offsets <- sort(unique(c(
+    seq(cfg$c_lo,  cfg$c_hi,  by = cfg$c_step),
+    seq(cfg$f_lo,  cfg$f_hi,  by = cfg$f_step),
+    seq(cfg$uf_lo, cfg$uf_hi, by = cfg$uf_step)
+  )))
+
+  results <- lapply(pi - offsets * pi / 180, calc_trajectory,
+                    wind_strength = wind_strength)
+  ground  <- Filter(function(r) r$reaches_ground, results)
+  best    <- ground[[which.min(sapply(ground, `[[`, "distance"))]]
+
+  # Attach wind label to trajectory for plotting
+  best$trajectory$wind_label <- sprintf("W = %.1e", wind_strength)
+
+  return(list(
+    summary = data.frame(
+      wind_strength = wind_strength,
+      angle_offset  = round(best$offset_deg, 3),
+      dist_m        = round(best$distance,   1)
+    ),
+    trajectory = best$trajectory
+  ))
+}
+
+# Main --------------------------------------------------------
+
+results_list <- lapply(wind_strengths, find_optimal_angle)
+
+# Extract summary table
+results      <- do.call(rbind, lapply(results_list, `[[`, "summary"))
+known_angles <- setNames(results[, c("wind_strength", "angle_offset")],
+                         c("wind_strength", "angle_deg"))
+
+# Print final angles
+cat("=== Optimal Initial Angles ===\n")
+cat("INITIAL_ANGLES <- c(\n")
+for (i in seq_len(nrow(results))) {
+  comma <- ifelse(i < nrow(results), ",", "")
+  cat(sprintf("  pi - pi/180 * %.3f%s   # W = %.1e  dist: %.1f m\n",
+              results$angle_offset[i], comma,
+              results$wind_strength[i], results$dist_m[i]))
+}
+cat(")\n")
+
+# Trajectory plot ---------------------------------------------
+
+# Combine all optimal trajectories into one data frame
+all_traj <- do.call(rbind, lapply(results_list, `[[`, "trajectory"))
+
+ggplot() +
+  # Trajectory paths
+  geom_path(data = all_traj,
+            aes(x = x, y = y, color = wind_label),
+            linewidth = 1.2) +
+  # Release point (start)
+  geom_point(data = data.frame(x = 0, y = 10000),
+             aes(x = x, y = y),
+             color = "green", size = 5, shape = 17) +
+  # Target point (origin on ground)
+  geom_point(data = data.frame(x = 0, y = 0),
+             aes(x = x, y = y),
+             color = "red", size = 5, shape = 16) +
+  coord_fixed(ratio = 1) +
+  scale_x_continuous(limits = c(-8000, 2000)) +
+  scale_y_continuous(limits = c(-500, 10500)) +
+  scale_color_discrete(name = "Wind Strength") +
+  theme_classic() +
+  labs(
+    title    = "Optimal Trajectories (Adaptive Search)",
+    subtitle = "Triangle = start,  Red circle = target origin",
+    x        = "x [m]",
+    y        = "y [m]"
+  ) +
+  theme(text            = element_text(size = 12, family = "Arial"),
+        legend.position = "bottom")
+```
+
+#Simulation
+```{r}
+BIRD_SPEED     <- 8          # Airspeed [m/s]
+INITIAL_HEIGHT <- 10000      # Initial altitude [m]
+GPS_INTERVAL   <- 60         # GPS sampling interval [s]
+MAX_SIM_TIME   <- 5000       # Maximum simulation time [s]
+
+# Trajectory & scatter plots
+OUTPUT_DIR <- "~/Documents/yodalab/data/model/"
+# Box plot & simulation results (CSV)
+DATA_DIR   <- "~/Documents/yodalab/data/model/"
+
+dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(DATA_DIR,   recursive = TRUE, showWarnings = FALSE)
+
+# Wind coefficients (7 conditions)
+WIND_COEFFICIENTS <- c(1.5e-4, 2.5e-4, 3.5e-4, 4.5e-4, 5.5e-4, 6.5e-4, 7.5e-4)
+
+# Optimal initial angles from Block 2
+INITIAL_ANGLES <- c(
+  pi - pi/180 * 5.330,   # W = 1.5e-4  dist: 0.4 m
+  pi - pi/180 * 8.770,   # W = 2.5e-4  dist: 0.0 m
+  pi - pi/180 * 12.030,  # W = 3.5e-4  dist: 0.2 m
+  pi - pi/180 * 15.040,  # W = 4.5e-4  dist: 0.7 m
+  pi - pi/180 * 17.730,  # W = 5.5e-4  dist: 0.5 m
+  pi - pi/180 * 20.020,  # W = 6.5e-4  dist: 1.0 m
+  pi - pi/180 * 21.850   # W = 7.5e-4  dist: 1.3 m
+)
+
+# Strategy colors (fixed across all plots)
+COLORS <- c(
+  "Optimal"              = "gold2",
+  "Goal Orientation"     = "seagreen",
+  "Perfect Compensation" = "steelblue"
+)
+
+# ODE for Optimal trajectory
+bird_ode <- function(t, state, params) {
+  with(as.list(c(state, params)), {
+    return(list(c(
+      Va * sin(state[3]) - W * state[2],  # dx
+      Va * cos(state[3]),                 # dy
+      -W * sin(state[3])^2                # dtheta (optimal control)
+    )))
+  })
+}
+
+# Goal Orientation trajectory
+# Strategy: always point airspeed toward origin
+calc_goal_orientation <- function(initial_state, times, params) {
+  Va <- params["Va"];  W <- params["W"]
+  n  <- length(times)
+  res <- data.frame(time = times, x = 0, y = 0, theta = 0)
+  res[1, c("x","y","theta")] <- initial_state
+
+  for (i in 2:n) {
+    dt  <- times[i] - times[i-1]
+    cx  <- res$x[i-1];  cy <- res$y[i-1]
+    # Heading toward origin in geographic coords
+    ang          <- atan2(-cx, -cy)
+    res$theta[i] <- ang
+    # Ground speed = airspeed + wind
+    gvx <- Va * sin(ang) - W * cy
+    gvy <- Va * cos(ang)
+    nx  <- cx + gvx * dt
+    ny  <- cy + gvy * dt
+
+    if (ny <= 0) {
+      # Linear interpolation to exact landing point
+      ratio    <- cy / (cy - ny)
+      res$x[i] <- cx + ratio * (nx - cx)
+      res$y[i] <- 0
+      if (i < n) {
+        lx             <- res$x[i]
+        res$x[(i+1):n] <- seq(lx, 0, length.out = n - i)
+        res$y[(i+1):n] <- 0
+      }
+      break
+    } else {
+      res$x[i] <- nx;  res$y[i] <- ny
+    }
+  }
+  res[!is.na(res$x), ]
+}
+
+# Perfect Compensation trajectory
+# Strategy: cancel wind drift so x-position stays 0
+calc_perfect_compensation <- function(times, params) {
+  Va <- params["Va"];  W <- params["W"]
+  n  <- length(times)
+  res <- data.frame(time = times, x = 0,
+                    y = 0, theta = 0, ground_speed = 0)
+  res$y[1] <- INITIAL_HEIGHT
+  cy <- INITIAL_HEIGHT
+
+  for (i in 2:n) {
+    dt         <- times[i] - times[i-1]
+    wind_speed <- W * cy
+
+    # Physical feasibility check
+    if (wind_speed >= Va) {
+      res$y[i] <- 0;  break
+    }
+
+    # sin(theta) = wind/Va to cancel x-drift
+    sin_t  <- wind_speed / Va
+    cos_t  <- sqrt(1 - sin_t^2)
+    gs_mag <- sqrt(Va^2 - wind_speed^2)
+
+    res$theta[i-1]        <- atan2(sin_t, -cos_t)
+    res$ground_speed[i-1] <- -gs_mag
+    ny <- cy - gs_mag * dt
+
+    if (ny <= 0) {
+      res$y[i] <- 0
+      if (i < n) { res$y[(i+1):n] <- 0 }
+      break
+    } else {
+      res$y[i] <- ny;  cy <- ny
+    }
+  }
+  res[!is.na(res$y), ]
+}
+
+# Crosswind component perpendicular to beeline toward origin
+calc_crosswind <- function(x, y, W) {
+  nest_dir <- atan2(-x, -y)
+  nx <- sin(nest_dir);  ny <- cos(nest_dir)
+  abs(-W * y * ny)  # Wy = 0, so cross = Wx*ny
+}
+
+# Instantaneous deflection angle from beeline direction
+calc_deflection <- function(x1, y1, x2, y2) {
+  mv <- c(x2 - x1, y2 - y1)
+  tv <- c(-x1,     -y1)
+  mm <- sqrt(sum(mv^2));  tm <- sqrt(sum(tv^2))
+  if (mm < 1e-10 || tm < 1e-10) return(0)
+  cos_a <- sum(mv * tv) / (mm * tm)
+  angle <- acos(pmax(pmin(cos_a, 1), -1)) * 180 / pi
+  ifelse(mv[1]*tv[2] - mv[2]*tv[1] < 0, -angle, angle)
+}
+
+run_simulation <- function(wind_coeff, initial_angle) {
+  params        <- c(Va = BIRD_SPEED, W = wind_coeff)
+  initial_state <- c(x = 0, y = INITIAL_HEIGHT, theta = initial_angle)
+  fine_times    <- seq(0, MAX_SIM_TIME, by = 10)
+
+  # Helper: find ground arrival time
+  get_end_time <- function(traj_df) {
+    idx <- which(traj_df$y <= 0)
+    if (length(idx) > 0) traj_df$time[min(idx)] else max(traj_df$time)
+  }
+
+  # Coarse run to find arrival times
+  opt_fine <- as.data.frame(ode(initial_state, fine_times,
+                                bird_ode, params, method = "lsoda"))
+  colnames(opt_fine) <- c("time","x","y","theta")
+  opt_end  <- get_end_time(opt_fine)
+
+  goal_fine <- calc_goal_orientation(initial_state, fine_times, params)
+  goal_end  <- get_end_time(goal_fine)
+
+  comp_fine <- calc_perfect_compensation(fine_times, params)
+  comp_end  <- get_end_time(comp_fine)
+
+  # Build GPS-interval time arrays
+  make_times <- function(end_t) {
+    ts <- seq(0, end_t, by = GPS_INTERVAL)
+    if (tail(ts, 1) < end_t) c(ts, end_t) else ts
+  }
+
+  # Rebuild trajectories at GPS_INTERVAL
+  opt_traj <- as.data.frame(ode(initial_state, make_times(opt_end),
+                                bird_ode, params, method = "lsoda"))
+  colnames(opt_traj) <- c("time","x","y","theta")
+  opt_traj$type <- "Optimal"
+
+  goal_traj      <- calc_goal_orientation(initial_state,
+                                          make_times(goal_end), params)
+  goal_traj$type <- "Goal Orientation"
+
+  comp_traj      <- calc_perfect_compensation(make_times(comp_end), params)
+  comp_traj$type <- "Perfect Compensation"
+
+  # Combine basic columns
+  cols <- c("time","x","y","theta","type")
+  traj <- bind_rows(opt_traj[, cols],
+                    goal_traj[, cols],
+                    comp_traj[, cols])
+
+  # Build analysis data (deflection vs crosswind at 1-min intervals)
+  analysis <- traj %>%
+    group_by(type) %>%
+    arrange(time) %>%
+    mutate(next_x    = lead(x),
+           next_y    = lead(y),
+           time_diff = lead(time) - time) %>%
+    filter(!is.na(next_x), !is.na(next_y),
+           abs(time_diff - 60) < 10) %>%
+    rowwise() %>%
+    mutate(
+      deflection = calc_deflection(x, y, next_x, next_y),
+      crosswind  = calc_crosswind(x, y, wind_coeff)
+    ) %>%
+    ungroup() %>%
+    filter(is.finite(deflection), is.finite(crosswind),
+           abs(deflection) < 100)
+
+  list(trajectories  = traj,
+       analysis      = analysis,
+       wind_coeff    = wind_coeff,
+       initial_angle = initial_angle)
+}
+
+# Trajectory plot (with wind arrows)
+make_trajectory_plot <- function(trajectories, wind_coeff) {
+  max_wind  <- wind_coeff * INITIAL_HEIGHT
+  arr_scale <- ifelse(wind_coeff < 5e-4, 800,
+               ifelse(wind_coeff < 8e-4, 400, 300))
+
+  wind_grid <- expand_grid(
+    x = seq(-6400, 6400, by = 800),
+    y = seq(0, 10000, by = 1000)
+  ) %>%
+    mutate(wind_u = -wind_coeff * y) %>%
+    filter(abs(wind_u) > 1e-6)
+
+  ggplot() +
+    geom_segment(
+      data = wind_grid,
+      aes(x = x, y = y, xend = x + wind_u * arr_scale, yend = y),
+      arrow = arrow(type = "closed", length = unit(0.4, "cm")),
+      color = "lightblue", linewidth = 1.2, alpha = 0.8
+    ) +
+    geom_path(data = trajectories,
+              aes(x = x, y = y, color = type),
+              linewidth = 1.5) +
+    geom_point(data = trajectories,
+               aes(x = x, y = y, color = type),
+               size = 3, alpha = 0.8) +
+    geom_point(data = data.frame(x = c(0,0), y = c(INITIAL_HEIGHT, 0)),
+               aes(x = x, y = y),
+               size = 5, shape = 21, fill = "white", color = "black") +
+    scale_color_manual(values = COLORS) +
+    coord_fixed() +
+    scale_x_continuous(limits = c(-5000, 5000)) +
+    scale_y_continuous(limits = c(-100,  10000)) +
+    theme_classic() +
+    labs(
+      title    = sprintf("Bird Flight Strategies (W = %.1e)", wind_coeff),
+      subtitle = sprintf("Va = %d m/s,  Max Wind = %.1f m/s",
+                         BIRD_SPEED, max_wind),
+      x = "x [m]", y = "y [m]", color = "Strategy"
+    ) +
+    theme(
+      legend.position   = "bottom",
+      text              = element_text(size = 16, family = "Arial"),
+      axis.title        = element_text(size = 18),
+      axis.text         = element_text(size = 14),
+      plot.title        = element_text(size = 18, hjust = 0.5),
+      plot.subtitle     = element_text(size = 12, hjust = 0.5),
+      axis.line         = element_line(linewidth = 0.8),
+      axis.ticks        = element_line(linewidth = 0.8),
+      axis.ticks.length = unit(0.3, "cm"),
+      plot.margin       = margin(20, 20, 20, 20)
+    )
+}
+
+# Scatter plot (deflection vs crosswind)
+make_scatter_plot <- function(analysis, wind_coeff) {
+  max_wind <- wind_coeff * INITIAL_HEIGHT
+  x_range  <- max_wind
+  y_range  <- x_range * 9.6
+  y_center <- max_wind * 3.2
+  x_breaks <- seq(0, ceiling(max_wind),
+                  by = ifelse(max_wind <= 2, 0.5, 1))
+  y_int    <- ifelse(max_wind <= 2, 4, ifelse(max_wind <= 4, 8, 10))
+
+  ggplot(analysis, aes(x = crosswind, y = deflection, color = type)) +
+    geom_point(alpha = 0.6, size = 2) +
+    geom_smooth(method = "lm", se = FALSE, linewidth = 1.2) +
+    scale_color_manual(values = COLORS) +
+    scale_x_continuous(limits = c(0, x_range), breaks = x_breaks) +
+    scale_y_continuous(
+      limits = c(y_center - y_range/2, y_center + y_range/2),
+      breaks = seq(
+        ceiling((y_center - y_range/2) / y_int) * y_int,
+        floor(  (y_center + y_range/2) / y_int) * y_int,
+        by = y_int)
+    ) +
+    coord_fixed(ratio = x_range / y_range) +
+    theme_classic() +
+    labs(
+      title = sprintf("Deflection vs Crosswind (W = %.1e)", wind_coeff),
+      x     = "Crosswind (m/s)",
+      y     = "Instantaneous deflection (deg)",
+      color = "Strategy"
+    ) +
+    theme(
+      legend.position   = "bottom",
+      text              = element_text(size = 16, family = "Arial"),
+      axis.title        = element_text(size = 18),
+      axis.text         = element_text(size = 14),
+      plot.title        = element_text(size = 18, hjust = 0.5),
+      axis.line         = element_line(linewidth = 0.8),
+      axis.ticks        = element_line(linewidth = 0.8),
+      axis.ticks.length = unit(0.3, "cm"),
+      plot.margin       = margin(20, 20, 20, 20)
+    )
+}
+
+# Box plot of regression slopes across wind conditions
+make_box_plot <- function(box_data) {
+  ggplot(box_data, aes(x = type, y = slope, fill = type)) +
+    geom_boxplot(alpha = 0.6, outlier.shape = NA,
+                 width = 0.8, color = "black", linewidth = 0.5) +
+    geom_point(aes(color = type),
+               position = position_jitter(width = 0.1, seed = 42),
+               size = 1, alpha = 0.8) +
+    scale_fill_manual(values  = COLORS) +
+    scale_color_manual(values = COLORS) +
+    scale_x_discrete(labels = c(
+      "Perfect Compensation" = "Perfect\nCompensation",
+      "Optimal"              = "Optimal",
+      "Goal Orientation"     = "Goal\nOrientation"
+    )) +
+    scale_y_continuous(
+      limits = c(-0.5, max(box_data$slope, na.rm = TRUE) * 1.05),
+      breaks = seq(0, ceiling(max(box_data$slope, na.rm = TRUE)), by = 1)
+    ) +
+    coord_cartesian(xlim = c(0.5, 3.5)) +
+    theme_classic() +
+    labs(x = "", y = "Degree of drift (deg/m/s)") +
+    theme(
+      legend.position   = "none",
+      text              = element_text(size = 18, family = "Arial"),
+      axis.title        = element_text(size = 18),
+      axis.text         = element_text(size = 16),
+      axis.text.x       = element_text(size = 14, hjust = 0.5,
+                                       lineheight = 0.8),
+      axis.line         = element_line(linewidth = 0.5),
+      axis.ticks        = element_line(linewidth = 0.5),
+      axis.ticks.length = unit(0.2, "cm"),
+      plot.margin       = margin(20, 20, 30, 20),
+      aspect.ratio      = 2.5,
+      panel.border      = element_rect(color = "black", fill = NA,
+                                       linewidth = 0.8)
+    )
+}
+
+run_statistics <- function(box_data) {
+  box_data$type <- factor(box_data$type,
+    levels = c("Perfect Compensation", "Optimal", "Goal Orientation"))
+
+  desc <- box_data %>%
+    group_by(type) %>%
+    summarise(n      = n(),
+              mean   = mean(slope,   na.rm = TRUE),
+              sd     = sd(slope,     na.rm = TRUE),
+              median = median(slope, na.rm = TRUE),
+              cv     = sd / abs(mean) * 100,
+              .groups = "drop")
+
+  cat("=== Descriptive Statistics ===\n");  print(desc)
+
+  # car:: prefix avoids namespace conflicts
+  levene <- car::leveneTest(slope ~ type, data = box_data)
+  cat("\n=== Levene's Test ===\n");  print(levene)
+
+  anova_res <- aov(slope ~ type, data = box_data)
+  anova_sum <- summary(anova_res)
+  cat("\n=== One-way ANOVA ===\n");  print(anova_sum)
+
+  cat("\n=== Tukey HSD ===\n");  print(TukeyHSD(anova_res))
+
+  eta2 <- anova_sum[[1]]["type","Sum Sq"] / sum(anova_sum[[1]][,"Sum Sq"])
+  cat(sprintf("\nEffect size (eta^2): %.3f\n", eta2))
+
+  list(desc = desc, levene = levene,
+       anova_sum = anova_sum, eta2 = eta2)
+}
+
+all_results  <- list()
+all_analysis <- data.frame()
+
+for (idx in seq_along(WIND_COEFFICIENTS)) {
+  w   <- WIND_COEFFICIENTS[idx]
+  ang <- INITIAL_ANGLES[idx]
+  cat(sprintf("[%d/%d] W = %.1e\n", idx, length(WIND_COEFFICIENTS), w))
+
+  sim                <- run_simulation(w, ang)
+  all_results[[idx]] <- sim
+
+  # Accumulate analysis data with wind label
+  sim$analysis$wind_label <- sprintf("W = %.1e", w)
+  all_analysis <- bind_rows(all_analysis, sim$analysis)
+
+  # Build combined plot (trajectory + scatter)
+  p_tr  <- make_trajectory_plot(sim$trajectories, w)
+  p_sc  <- make_scatter_plot(sim$analysis, w)
+  cplot <- grid.arrange(p_tr, p_sc, ncol = 2)
+
+  # Display in RStudio viewer
+  print(cplot)
+
+  # Save to OUTPUT_DIR
+  fname <- sprintf("simulation_wind_%d_W%.0e.png", idx, w)
+  ggsave(file.path(OUTPUT_DIR, fname),
+         cplot, width = 16, height = 8, dpi = 800, bg = "white")
+  cat("  Saved:", file.path(OUTPUT_DIR, fname), "\n")
+}
+
+cat("\n=== All simulations completed ===\n\n")
+
+# Extract regression slopes per strategy per wind condition
+box_data <- all_analysis %>%
+  group_by(type, wind_label) %>%
+  summarise(
+    slope = ifelse(n() >= 3,
+                   lm(deflection ~ crosswind)$coefficients[2], NA),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(slope))
+
+box_data$type <- factor(box_data$type,
+  levels = c("Perfect Compensation", "Optimal", "Goal Orientation"))
+
+# Run statistics
+stats <- run_statistics(box_data)
+
+p_box <- make_box_plot(box_data)
+print(p_box)
+ggsave(file.path(DATA_DIR, "slope_boxplot.png"),
+       p_box, width = 6, height = 12, dpi = 800, bg = "white")
+
+write_csv(stats$desc,
+          file.path(DATA_DIR, "descriptive_statistics.csv"))
+
+cat("\nTrajectory plots saved to :", OUTPUT_DIR, "\n")
+cat("Box plot saved to          :", file.path(DATA_DIR, "slope_boxplot.png"), "\n")
+cat("Stats CSV saved to         :", file.path(DATA_DIR, "descriptive_statistics.csv"), "\n")
+```
+
+
