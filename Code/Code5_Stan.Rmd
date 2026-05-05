@@ -1,0 +1,606 @@
+---
+title: 'Stan'
+author: "YusukeGoto, Serina"
+date: "2024-04-10"
+output: html_document
+---
+#library
+```{r setup, include=FALSE}
+library(pacman)
+library(dplyr)
+
+ p_load(loo,lubridate,suncalc,gridExtra,grid,ggplot2,dplyr,brms,rstan,
+        tidyverse,bayesplot,lme4,DHARMa,plotly,RColorBrewer,classInt,htmlwidgets,
+        orca,readr,V8,patchwork,tidyverse,here,extrafont,cowplot,tibble)
+ 
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+```
+
+#data
+```{r}
+rm(list=ls())
+set.seed(123)
+
+all_sea_data <- read_csv(here("~/Documents/yodalab/paper/JAB/data/not_for_upload/data_for_stan.csv"))
+
+add_day_night_column <- function(df) {
+  # UTC→JST
+  df$time <- with_tz(df$time, "Japan")
+  # POSIXct→Date
+  date_only <- as.Date(df$time)
+
+  # Calculate sunset sunrise
+  sun_data <- data.frame(date = date_only, lat = df$lat, lon = df$lon)
+  sun_times <- getSunlightTimes(data = sun_data, keep = c("sunrise", "sunset"))
+  sun_times$sunrise <- with_tz(sun_times$sunrise, "Japan")
+  sun_times$sunset <- with_tz(sun_times$sunset, "Japan")
+  df$day_night <- mapply(function(time, sunrise, sunset) {
+    hour_time <- format(time, "%H:%M:%S")
+    hour_sunrise <- format(sunrise, "%H:%M:%S")
+    hour_sunset <- format(sunset, "%H:%M:%S")
+    if (hour_time >= hour_sunrise & hour_time <= hour_sunset) {
+      return("Day")
+    } else {
+      return("Night")
+    }
+  }, df$time, sun_times$sunrise, sun_times$sunset)
+
+  return(df)
+}
+
+all_sea_data <- add_day_night_column(all_sea_data)
+all_sea_data$day_night <- ifelse(all_sea_data$day_night == "Day", 1, 0)
+
+# UTC→JST
+all_sea_data$time <- with_tz(all_sea_data$time, "Japan")
+# NA removal
+all_sea_data <- all_sea_data[!is.na(all_sea_data$age) &
+                               !is.na(all_sea_data$α) &
+                               !is.na(all_sea_data$wind_cross), ]
+all_sea_data <- all_sea_data  %>% mutate(foot_year = paste(foot,year,sep="_"))
+```
+
+# make the dataframe to give stan
+```{r}
+all_sea_data <- all_sea_data[!is.na(all_sea_data$age) & 
+                             !is.na(all_sea_data$α) & 
+                             !is.na(all_sea_data$wind_cross), ]
+
+all_sea_data$Nest_Distance <- as.vector(scale(all_sea_data$Nest_Distance))
+all_sea_data$age <- all_sea_data$age - min(all_sea_data$age) + 1
+
+all_sea_data <- all_sea_data %>%
+  mutate(year_foot = paste(year, foot, sep = "_"))
+
+# 1. Age_ID[N_Bird]: Age corresponding to each individual (year_foot)
+unique_bird_age <- all_sea_data %>%
+  dplyr::select(year_foot, age) %>%
+  distinct() %>%
+  arrange(year_foot)
+
+Age_ID <- unique_bird_age$age
+
+# 2. Bird_ID[N_Trip]: Individual ID corresponding to each trip
+unique_trip_bird <- all_sea_data %>%
+  dplyr::select(ID, year_foot) %>%
+  distinct() %>%
+  arrange(ID) %>% 
+  left_join(unique_bird_age %>% mutate(bird_index = row_number()), by = "year_foot")
+
+Bird_ID <- unique_trip_bird$bird_index
+
+# 3. Trip_ID[N]: Trip ID corresponding to each observation
+Trip_ID <- as.integer(as.factor(all_sea_data$ID))
+
+# data_list_sea
+data_list_sea <- list(
+  N = nrow(all_sea_data),
+  N_Age = max(all_sea_data$age),
+  N_Bird = length(unique(all_sea_data$year_foot)),
+  N_Trip = length(unique(all_sea_data$ID)),  
+  alpha = as.vector(all_sea_data$α),
+  Nest_Distance = as.vector(all_sea_data$Nest_Distance),
+  wind_cross = as.vector(all_sea_data$wind_cross),
+  Age_ID = Age_ID,    
+  Bird_ID = Bird_ID,  
+  Trip_ID = Trip_ID,  
+  day_night = as.vector(all_sea_data$day_night)
+)
+```
+
+#model
+```{r}
+set.seed(1235)
+options(timeout = 1000000)
+
+model <- "
+data {
+  int<lower=0> N;  // Total number of data points
+  int<lower=1> N_Age;// Range of ages in the data: (max age) - (min age) + 1
+  int<lower=1> N_Bird;  // Total number of individual IDs
+  int<lower=1> N_Trip;  // Total number of trip IDs
+  vector[N] alpha;  // Response variable (instantaneous deflection)
+  vector[N] Nest_Distance;  // Distance from the nest
+  vector[N] wind_cross;  // Crosswind component
+  int<lower=1,upper=N_Age> Age_ID[N_Bird];  // Age for each individual
+  int<lower=1,upper=N_Bird> Bird_ID[N_Trip];  // Individual ID for each trip
+  int<lower=1,upper=N_Trip> Trip_ID[N];  // Trip ID for each observation
+  vector[N] day_night; // Light condition (day/night)
+
+}
+
+parameters {
+  vector[N_Age] a;// Slope for each age
+  vector[N_Bird] a_Bird;  // Individual-level slope
+  vector[N_Trip] a_Trip;  // Trip-level slope
+  vector[N_Trip] d_Trip;  // Trip-level intercept
+  real c;  // Coefficient for the linear term
+  real c2; // Coefficient for the quadratic term
+  real e; // Parameter representing the effect of day/night
+  real<lower=0> s_a[N_Age];  // Variance of a_Bird (individual-level slope variance)
+  real<lower=0> s_a_Trip[N_Age];  // Variance of a_Trip (trip-level slope variance)
+  real<lower=0> s_d;  // Variance of d_Trip (trip-level intercept variance)
+  real<lower=0> c_a;  // Strength of age correlation in a
+  real<lower=0> c_s_a;  // Strength of age correlation in s_a
+  real<lower=0> c_s_a_Trip;  // Strength of age correlation in s_a_Trip
+  real<lower=0> s_obs;  // Observation error of alpha
+}
+
+model {
+  // Age correlation in a and s_a
+        a[2:N_Age] ~ normal(a[1:(N_Age-1)],c_a);
+      s_a[2:N_Age] ~ normal(s_a[1:(N_Age-1)],c_s_a);
+ s_a_Trip[2:N_Age] ~ normal(s_a_Trip[1:(N_Age-1)],c_s_a_Trip);
+  // Priors for individual-level parameters
+  for(k in 1:N_Bird){  
+  a_Bird[k] ~ normal(a[Age_ID[k]], s_a[Age_ID[k]]);
+  }
+  
+  // Priors for trip-level parameters
+  for(k in 1:N_Trip){
+  a_Trip[k] ~ normal(a_Bird[Bird_ID[k]], s_a_Trip[Age_ID[Bird_ID[k]]]);  // Ringに基づいて個体レベルの傾きを参照
+  }
+  d_Trip ~ normal(0, s_d);  // Reference individual-level slope based on Bird_ID
+
+  // Model
+  for (n in 1:N) {
+    alpha[n] ~ normal((a_Trip[Trip_ID[n]] + c * Nest_Distance[n] + c2 * pow(Nest_Distance[n], 2) + e * day_night[n]) * wind_cross[n] + d_Trip[Trip_ID[n]], s_obs);
+  }
+}
+
+generated quantities {
+  vector[N] log_lik;
+  for (n in 1:N) {
+    log_lik[n] = normal_lpdf(alpha[n] | (a_Trip[Trip_ID[n]] + c * Nest_Distance[n] + c2 * pow(Nest_Distance[n], 2) + e * day_night[n]) * wind_cross[n] + d_Trip[Trip_ID[n]], s_obs);
+  }
+}
+"
+# Extend the socket timeout to prevent disconnection during long sampling
+options(timeout = 100000)
+
+# fit_dist <- stan(
+#   model_code = model, 
+#   data = data_list_sea, 
+#   iter = 11000, 
+#   warmup = 1000, 
+#   chains = 4, 
+#   control = list(
+#     max_treedepth = 15,
+#     adapt_delta = 0.99
+#   )
+# )
+# 
+# saveRDS(fit_dist, "~/Documents/yodalab/paper/JAB/data/not_for_upload/Stan/StanResult_dist_forpaper.rds")
+# 
+
+#If it is too heavy for your laptop:
+# Run Chain 1
+out_dir <- "~/Documents/yodalab/paper/JAB/data/not_for_upload/Stan/"
+
+dir.create(
+  out_dir,
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+# Run Chain 1
+fit1 <- stan(
+  model_code = model,
+  data = data_list_sea,
+  iter = 11000,
+  warmup = 1000,
+  chains = 1,
+  chain_id = 1,
+  control = list(
+    max_treedepth = 15,
+    adapt_delta = 0.99
+  )
+)
+
+saveRDS(
+  fit1,
+  paste0(out_dir, "fit1.rds")
+)
+
+# Run Chain 2
+fit2 <- stan(
+  model_code = model,
+  data = data_list_sea,
+  iter = 11000,
+  warmup = 1000,
+  chains = 1,
+  chain_id = 2,
+  control = list(
+    max_treedepth = 15,
+    adapt_delta = 0.99
+  )
+)
+
+saveRDS(
+  fit2,
+  paste0(out_dir, "fit2.rds")
+)
+
+# Run Chain 3
+fit3 <- stan(
+  model_code = model,
+  data = data_list_sea,
+  iter = 11000,
+  warmup = 1000,
+  chains = 1,
+  chain_id = 3,
+  control = list(
+    max_treedepth = 15,
+    adapt_delta = 0.99
+  )
+)
+
+saveRDS(
+  fit3,
+  paste0(out_dir, "fit3.rds")
+)
+
+# Run Chain 4
+fit4 <- stan(
+  model_code = model,
+  data = data_list_sea,
+  iter = 11000,
+  warmup = 1000,
+  chains = 1,
+  chain_id = 4,
+  control = list(
+    max_treedepth = 15,
+    adapt_delta = 0.99
+  )
+)
+
+saveRDS(
+  fit4,
+  paste0(out_dir, "fit4.rds")
+)
+
+# Combine chains
+fit_dist <- sflist2stanfit(
+  list(fit1, fit2, fit3, fit4)
+)
+
+saveRDS(
+  fit_dist,
+  paste0(out_dir, "StanResult_dist_forpaper.rds")
+)
+```
+
+#result
+```{r}
+set.seed(123) 
+
+fit_dist　<- readRDS(file = "~/Documents/yodalab/paper/JAB/data/not_for_upload/Stan/StanResult_dist_forpaper.rds")
+print(fit_dist, probs = c(0.025, 0.975), pars = c("e","c","c2", "s_a", "s_a_Trip", "s_d", "c_a", "c_s_a", "c_s_a_Trip", "s_obs"), include = TRUE)
+```
+
+#Figure4
+Environmental effects included (day = 1, distance = median)
+```{r}
+#fit <- readRDS(here("~/Documents/yodalab/paper/JAB/data/not_for_upload/Stan/StanResult_dist_forpaper.rds"))
+#fit <- readRDS(here("~/Documents/yodalab/paper/JAB/data/StanResult_dist_forpaper.rds"))
+
+all_sea_data <- read_csv(here("~/Documents/yodalab/paper/JAB/data/final_data_for_stan.csv"))
+all_sea_data <- all_sea_data %>%
+  mutate(year_foot = paste(year, foot, sep = "_"))
+
+if(abs(mean(all_sea_data$Nest_Distance, na.rm = TRUE)) > 1000) {
+  all_sea_data$Nest_Distance <- as.vector(scale(all_sea_data$Nest_Distance))
+}
+
+extract_params_with_env <- function(fit, param_name) {
+  param <- rstan::extract(fit, pars = param_name)[[param_name]]
+  mean_param <- apply(param, 2, mean)
+  lower_ci_95 <- apply(param, 2, quantile, probs = 0.025)
+  upper_ci_95 <- apply(param, 2, quantile, probs = 0.975)
+  lower_ci_75 <- apply(param, 2, quantile, probs = 0.125)
+  upper_ci_75 <- apply(param, 2, quantile, probs = 0.875)
+  
+  data.frame(
+    mean = mean_param, 
+    lower_ci_95 = lower_ci_95, 
+    upper_ci_95 = upper_ci_95,
+    lower_ci_75 = lower_ci_75, 
+    upper_ci_75 = upper_ci_75
+  )
+}
+
+a_post <- extract_params_with_env(fit, "a")
+s_a_post <- extract_params_with_env(fit, "s_a")
+s_a_Trip_post <- extract_params_with_env(fit, "s_a_Trip")
+
+c_params <- rstan::extract(fit, pars = "c")$c
+c2_params <- rstan::extract(fit, pars = "c2")$c2
+e_params <- rstan::extract(fit, pars = "e")$e
+
+c_mean <- mean(c_params)
+c2_mean <- mean(c2_params)
+e_mean <- mean(e_params)
+
+nest_distance_median <- median(all_sea_data$Nest_Distance, na.rm = TRUE)
+day_night_value <- 1  # Day
+
+environmental_effect <- c_mean * nest_distance_median + 
+                       c2_mean * nest_distance_median^2 + 
+                       e_mean * day_night_value
+
+unique_age_mapping <- all_sea_data %>%
+  dplyr::select(year_foot, age) %>%
+  distinct() 
+
+df_age <- data.frame(Age = unique_age_mapping$age)
+min_age <- min(df_age$Age)
+max_age <- max(df_age$Age)
+
+data_a_age_only <- tibble(
+  Age = min_age:max_age,
+  Mean = a_post$mean,
+  LowerCI95 = a_post$lower_ci_95,
+  UpperCI95 = a_post$upper_ci_95,
+  LowerCI75 = a_post$lower_ci_75,
+  UpperCI75 = a_post$upper_ci_75,
+  Type = "Age effect only"
+)
+
+data_a_with_env <- tibble(
+  Age = min_age:max_age,
+  Mean = a_post$mean + environmental_effect,
+  LowerCI95 = a_post$lower_ci_95 + environmental_effect,
+  UpperCI95 = a_post$upper_ci_95 + environmental_effect,
+  LowerCI75 = a_post$lower_ci_75 + environmental_effect,
+  UpperCI75 = a_post$upper_ci_75 + environmental_effect,
+  Type = "With environmental effects"
+)
+
+data_a_comparison <- rbind(data_a_age_only, data_a_with_env)
+
+data_s_a <- tibble(
+  Age = min_age:max_age,
+  Mean = s_a_post$mean,
+  LowerCI95 = s_a_post$lower_ci_95,
+  UpperCI95 = s_a_post$upper_ci_95,
+  LowerCI75 = s_a_post$lower_ci_75,
+  UpperCI75 = s_a_post$upper_ci_75,
+  var = rep("SD_among_Ind", nrow(s_a_post))
+)
+
+data_s_a_Trip <- tibble(
+  Age = min_age:max_age,
+  Mean = s_a_Trip_post$mean,
+  LowerCI95 = s_a_Trip_post$lower_ci_95,
+  UpperCI95 = s_a_Trip_post$upper_ci_95,
+  LowerCI75 = s_a_Trip_post$lower_ci_75,
+  UpperCI75 = s_a_Trip_post$upper_ci_75,
+  var = rep("SD_within_Ind", nrow(s_a_Trip_post))
+)
+
+plot_df <- rbind(data_s_a, data_s_a_Trip)
+
+common_theme <- theme_bw(base_family = "Arial") +
+  theme(
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 1),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(colour = "black", linewidth = 0.2),
+    axis.ticks = element_line(colour = "black", linewidth = 0.2),
+    plot.margin = unit(c(0.5, 0.5, 0.5, 0.5), "cm"),
+    text = element_text(size = 24),
+    axis.text = element_text(size = 24),
+    axis.title = element_text(size = 24),
+    plot.title = element_text(size = 24)
+  )
+
+x_min <- min(df_age$Age) - 0.5
+x_max <- max(df_age$Age) + 0.5
+
+common_x_axis <- scale_x_continuous(
+  limits = c(x_min, x_max),
+  breaks = seq(ceiling(x_min), floor(x_max), by = 2),
+  expand = c(0, 0)
+)
+
+p_h <- ggplot(df_age) +
+  geom_histogram(aes(x = Age), fill = "steelblue4", binwidth = 1) +
+  common_x_axis +
+  common_theme +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_blank()) +
+  ylab("Individual number")
+
+p_a_env <- ggplot(data_a_with_env, aes(x = Age, y = Mean)) +
+  geom_hline(yintercept = 0, color = "black", linewidth = 0.8, linetype = "dashed") +
+  geom_point(size = 4) +
+  geom_line() +
+  geom_ribbon(aes(ymin = LowerCI95, ymax = UpperCI95), alpha = 0.2, fill = "lightskyblue") +
+  geom_ribbon(aes(ymin = LowerCI75, ymax = UpperCI75), alpha = 0.4, fill = "steelblue") +
+  common_x_axis +
+  common_theme +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_blank()) +
+  ylab("Degree of drift") 
+
+p_s <- ggplot(plot_df, aes(x = Age, y = Mean, group = var, color = var)) +
+  geom_point(size = 4) +
+  geom_line() +
+  geom_ribbon(aes(ymin = LowerCI95, ymax = UpperCI95, fill = var), alpha = 0.2, color = NA) +
+  geom_ribbon(aes(ymin = LowerCI75, ymax = UpperCI75, fill = var), alpha = 0.4, color = NA) +
+  scale_color_manual(values = c("SD_among_Ind" = "darkorange", "SD_within_Ind" = "yellowgreen")) +
+  scale_fill_manual(values = c("SD_among_Ind" = "darkorange", "SD_within_Ind" = "yellowgreen")) +
+  common_x_axis +
+  common_theme +
+  theme(legend.position = "none") +
+  ylab("SD of degree of drift") +
+  xlab("Age")
+
+p_comb_env_only <- plot_grid(p_h, p_a_env, p_s, 
+                             ncol = 1, rel_heights = c(0.2, 0.4, 0.4), align = "v")
+
+ggsave(here("~/Documents/yodalab/paper/JAB/figure/Figure4_environmental_effects.png"), 
+       plot = p_comb_env_only, width = 10, height = 16, dpi = 600)
+```
+
+###############Code used for supplementary result###############
+#Used the data with age 9 to 23
+```{r}
+# NA除去
+all_sea_data <- all_sea_data[!is.na(all_sea_data$age) & 
+                             !is.na(all_sea_data$α) & 
+                             !is.na(all_sea_data$wind_cross), ]
+
+all_sea_data <- all_sea_data %>%
+  filter(age %in% c(9:23))
+
+all_sea_data$Nest_Distance <- as.vector(scale(all_sea_data$Nest_Distance))
+all_sea_data$age <- all_sea_data$age - min(all_sea_data$age) + 1
+
+all_sea_data <- all_sea_data %>%
+  mutate(year_foot = paste(year, foot, sep = "_"))
+
+unique_bird_age <- all_sea_data %>%
+  dplyr::select(year_foot, age) %>%
+  distinct() %>%
+  arrange(year_foot)
+
+Age_ID <- unique_bird_age$age
+
+unique_trip_bird <- all_sea_data %>%
+  dplyr::select(ID, year_foot) %>%
+  distinct() %>%
+  arrange(ID) %>%
+  left_join(unique_bird_age %>% mutate(bird_index = row_number()), by = "year_foot")
+
+Bird_ID <- unique_trip_bird$bird_index
+
+Trip_ID <- as.integer(as.factor(all_sea_data$ID))
+
+data_list_sea <- list(
+  N = nrow(all_sea_data),
+  N_Age = max(all_sea_data$age),
+  N_Bird = length(unique(all_sea_data$year_foot)),
+  N_Trip = length(unique(all_sea_data$ID)),  
+  alpha = as.vector(all_sea_data$α),
+  Nest_Distance = as.vector(all_sea_data$Nest_Distance),
+  wind_cross = as.vector(all_sea_data$wind_cross),
+  Age_ID = Age_ID,    
+  Bird_ID = Bird_ID,  
+  Trip_ID = Trip_ID,  
+  day_night = as.vector(all_sea_data$day_night)
+)
+```
+
+#model with age 9 to 23
+```{r}
+
+model <- "
+data {
+  int<lower=0> N;  // Total number of data points
+  int<lower=1> N_Age;// Range of ages in the data: (max age) - (min age) + 1
+  int<lower=1> N_Bird;  // Total number of individual IDs
+  int<lower=1> N_Trip;  // Total number of trip IDs
+  vector[N] alpha;  // Response variable (instantaneous deflection)
+  vector[N] Nest_Distance;  // Distance from the nest
+  vector[N] wind_cross;  // Crosswind component
+  int<lower=1,upper=N_Age> Age_ID[N_Bird];  // Age for each individual
+  int<lower=1,upper=N_Bird> Bird_ID[N_Trip];  // Individual ID for each trip
+  int<lower=1,upper=N_Trip> Trip_ID[N];  // Trip ID for each observation
+  vector[N] day_night; // Light condition (day/night)
+
+}
+
+parameters {
+  vector[N_Age] a;// Slope for each age
+  vector[N_Bird] a_Bird;  // Individual-level slope
+  vector[N_Trip] a_Trip;  // Trip-level slope
+  vector[N_Trip] d_Trip;  // Trip-level intercept
+  real c;  // Coefficient for the linear term
+  real c2; // Coefficient for the quadratic term
+  real e; // Parameter representing the effect of day/night
+  real<lower=0> s_a[N_Age];  // Variance of a_Bird (individual-level slope variance)
+  real<lower=0> s_a_Trip[N_Age];  // Variance of a_Trip (trip-level slope variance)
+  real<lower=0> s_d;  // Variance of d_Trip (trip-level intercept variance)
+  real<lower=0> c_a;  // Strength of age correlation in a
+  real<lower=0> c_s_a;  // Strength of age correlation in s_a
+  real<lower=0> c_s_a_Trip;  // Strength of age correlation in s_a_Trip
+  real<lower=0> s_obs;  // Observation error of alpha
+}
+
+model {
+  // Age correlation in a and s_a
+        a[2:N_Age] ~ normal(a[1:(N_Age-1)],c_a);
+      s_a[2:N_Age] ~ normal(s_a[1:(N_Age-1)],c_s_a);
+ s_a_Trip[2:N_Age] ~ normal(s_a_Trip[1:(N_Age-1)],c_s_a_Trip);
+  // Priors for individual-level parameters
+  for(k in 1:N_Bird){  
+  a_Bird[k] ~ normal(a[Age_ID[k]], s_a[Age_ID[k]]);
+  }
+  
+  // Priors for trip-level parameters
+  for(k in 1:N_Trip){
+  a_Trip[k] ~ normal(a_Bird[Bird_ID[k]], s_a_Trip[Age_ID[Bird_ID[k]]]);  // Ringに基づいて個体レベルの傾きを参照
+  }
+  d_Trip ~ normal(0, s_d);  // Reference individual-level slope based on Bird_ID
+
+  // Model
+  for (n in 1:N) {
+    alpha[n] ~ normal((a_Trip[Trip_ID[n]] + c * Nest_Distance[n] + c2 * pow(Nest_Distance[n], 2) + e * day_night[n]) * wind_cross[n] + d_Trip[Trip_ID[n]], s_obs);
+  }
+}
+
+generated quantities {
+  vector[N] log_lik;
+  for (n in 1:N) {
+    log_lik[n] = normal_lpdf(alpha[n] | (a_Trip[Trip_ID[n]] + c * Nest_Distance[n] + c2 * pow(Nest_Distance[n], 2) + e * day_night[n]) * wind_cross[n] + d_Trip[Trip_ID[n]], s_obs);
+  }
+}
+"
+
+# Extend the socket timeout to prevent disconnection during long sampling
+options(timeout = 100000)
+
+fit_dist <- stan(
+  model_code = model, 
+  data = data_list_sea, 
+  iter = 11000, 
+  warmup = 1000, 
+  chains = 4, 
+  control = list(
+    max_treedepth = 15,
+    adapt_delta = 0.99
+  )
+)
+
+saveRDS(fit_dist,file=here("~/Documents/yodalab/paper/JAB/data/not_for_upload/Stan/StanResult_dist_forpaper.rds"))
+```
+
+#result
+```{r}
+fit_dist2　<- readRDS(file = "~/Documents/yodalab/paper/JAB/data/not_for_upload/Stan/StanResult_9to23.rds")
+# print(fit_dist, probs = c(0.025, 0.975), pars = c("e","c","c2", "s_a", "s_a_Trip", "s_d", "c_a", "c_s_a", "c_s_a_Trip", "s_obs"), include = TRUE)
+
+print(fit_dist2, probs = c(0.025, 0.975), pars = c("e","c","c2", "c_a", "c_s_a", "c_s_a_Trip"), include = TRUE)
+```

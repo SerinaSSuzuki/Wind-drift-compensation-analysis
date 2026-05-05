@@ -1,0 +1,1345 @@
+---
+title: "Figure"
+output: html_document
+date: "2024-03-26"
+---
+
+#library
+```{r}
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(tidyverse)
+library(ggspatial)
+library(circular)
+library(ncdf4)
+library(maps)
+library(lubridate)
+library(viridis)
+library(extrafont)
+library(patchwork)
+library(gridExtra)
+library(lme4)
+library(lmerTest)
+library(ggeffects)
+library(geosphere)
+library(here)
+library(RColorBrewer)
+library(viridis)
+library(cowplot)
+```
+
+#data
+```{r}
+rm(list=ls())
+set.seed(123) 
+all_sea_data <- read_csv("~/Documents/yodalab/paper/JAB/data/final_data_for_stan.csv")
+length(unique(all_sea_data$ID))
+
+all_sea_data <- all_sea_data[!is.na(all_sea_data$age) & 
+                             !is.na(all_sea_data$α) & 
+                             !is.na(all_sea_data$wind_cross), ]
+
+font_import(pattern = "Arial", prompt = FALSE)
+```
+
+#Figure3A Wind characteristics around Kabushima Island
+```{r}
+#Need to use the same range (lon, lat) of wind all year
+file_path <- "~/Documents/yodalab/data/wind/"
+output_dir <- "~/Documents/yodalab/paper/JAB/figure/"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+process_year_data <- function(year) {
+  nc_file <- nc_open(paste0(file_path, "wind_", year, ".nc"))
+  
+  u_wind <- ncdf4::ncvar_get(nc_file, "u10")
+  v_wind <- ncvar_get(nc_file, "v10")
+  lon <- ncdf4::ncvar_get(nc_file, "longitude")
+  lat <- ncdf4::ncvar_get(nc_file, "latitude")
+  
+  time <- ncdf4::ncvar_get(nc_file, "valid_time")
+  time_dates <- as.POSIXct(time, origin="1970-01-01", tz="UTC")
+  
+  grid <- expand.grid(
+    lon = lon,
+    lat = lat,
+    time = time_dates
+  )
+  
+  grid$u <- as.vector(u_wind)
+  grid$v <- as.vector(v_wind)
+  grid$speed <- sqrt(grid$u^2 + grid$v^2)
+  grid$year <- year
+  
+  nc_close(nc_file)
+  
+  result <- grid %>% 
+    filter(month(time) %in% 5:7)
+  
+  cat(sprintf("Processed year %d: %d rows\n", year, nrow(result)))
+  
+  return(result)
+}
+
+x_range <- c(141.1705, 143.0207)
+y_range <- c(39.5, 42)
+years <- 2013:2022
+
+all_wind_data <- map_df(years, process_year_data)
+
+filtered_wind_data <- all_wind_data %>%
+  filter(lon >= x_range[1] & lon <= x_range[2] &
+         lat >= y_range[1] & lat <= y_range[2])
+
+grid_x <- seq(x_range[1], x_range[2], length.out = 100)
+grid_y <- seq(y_range[1], y_range[2], length.out = 100)
+
+calculate_grid_wind <- function(data) {
+  if(nrow(data) == 0) {
+    stop("data empty")
+  }
+  
+  result <- data %>%
+    mutate(
+      grid_x = cut(lon, breaks = grid_x, include.lowest = TRUE),
+      grid_y = cut(lat, breaks = grid_y, include.lowest = TRUE)
+    ) %>%
+    group_by(grid_x, grid_y) %>%
+    summarise(
+      mean_lon = mean(lon, na.rm = TRUE),
+      mean_lat = mean(lat, na.rm = TRUE),
+      mean_u = mean(u, na.rm = TRUE),
+      mean_v = mean(v, na.rm = TRUE),
+      mean_speed = mean(speed, na.rm = TRUE),
+      .groups = 'drop'
+    )
+  
+  return(result)
+}
+
+grid_wind_list <- list()
+for (year in years) {
+  year_data <- filtered_wind_data %>%
+    filter(year == !!year)
+  grid_wind_list[[as.character(year)]] <- calculate_grid_wind(year_data)
+}
+
+all_years_mean <- filtered_wind_data %>%
+  mutate(
+    grid_x = cut(lon, breaks = grid_x, include.lowest = TRUE),
+    grid_y = cut(lat, breaks = grid_y, include.lowest = TRUE)
+  ) %>%
+  group_by(grid_x, grid_y) %>%
+  summarise(
+    mean_lon = mean(lon, na.rm = TRUE),
+    mean_lat = mean(lat, na.rm = TRUE),
+    mean_u = mean(u, na.rm = TRUE),
+    mean_v = mean(v, na.rm = TRUE),
+    mean_speed = mean(speed, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+japan <- st_as_sf(maps::map("world", "Japan", plot = FALSE, fill = TRUE))
+
+create_wind_plot <- function(grid_wind_data, title, year) {
+  if(nrow(grid_wind_data) == 0) {
+    stop("data empty")
+  }
+  
+  scale_factor <- 0.02
+  
+ggplot() +
+    geom_sf(data = japan, fill = "grey90", color = "grey50", linewidth = 0.2) +
+    geom_segment(data = grid_wind_data,
+                aes(x = mean_lon,
+                    y = mean_lat,
+                    xend = mean_lon + (mean_u/sqrt(mean_u^2 + mean_v^2)) * mean_speed * scale_factor,
+                    yend = mean_lat + (mean_v/sqrt(mean_u^2 + mean_v^2)) * mean_speed * scale_factor,
+                    color = mean_speed),
+                arrow = arrow(length = unit(0.3, "cm"), type = "closed"),
+                linewidth = 0.6) +
+    scale_color_viridis(
+      option = "viridis",
+      name = "Wind Speed (m/s)",
+      limits = c(0, 6.2),
+      breaks = seq(0, 6.2, by = 2)
+    ) +
+    coord_sf(
+      xlim = x_range,
+      ylim = y_range,
+      expand = FALSE
+    ) +
+    theme_void(base_family = "Arial") +
+    labs(
+      title = title,
+      x = "Longitude",
+      y = "Latitude"
+    ) +
+    theme(
+      text = element_text(family = "Arial"), 
+      plot.title = element_text(size = 12, hjust = 0.5, margin = margin(b = 20)),
+      axis.title = element_text(size = 14),
+      axis.text = element_text(size = 12),
+      legend.title = element_text(size = 12),
+      legend.text = element_text(size = 10),
+      plot.background = element_rect(fill = "white", color = NA),
+      legend.background = element_rect(fill = "white", color = NA),
+      legend.key = element_rect(color = NA),
+      legend.box.background = element_blank(),
+      panel.border = element_blank(),
+      plot.margin = margin(t = 10, r = 10, b = 30, l = 10, unit = "pt"),
+      axis.title.x = element_text(margin = margin(t = 10)),
+      axis.title.y = element_text(angle = 90, vjust = 0.5)
+    )
+}
+for (year in years) {
+  title <- sprintf("%d", year)
+  p <- create_wind_plot(grid_wind_list[[as.character(year)]], title, year)
+  ggsave(paste0(output_dir, "wind_map_japan_", year, ".png"),
+         plot = p, width = 12, height = 9, dpi = 600)
+}
+
+mean_plot <- create_wind_plot(all_years_mean, "2013-2022", NA)
+ggsave(paste0(output_dir, "wind_map_japan_mean.png"),
+       plot = mean_plot, width = 12, height = 9, dpi = 600)
+```
+
+#Figure3B Wind characteristics around Kabushima Island
+```{r}
+wind_data <- all_sea_data %>%
+  group_by(label, ID) %>%
+  summarise(
+    mean_wind_speed = mean(sqrt(Wx^2 + Wy^2)),
+    mean_sin = mean(sin(atan2(Wy, Wx))),
+    mean_cos = mean(cos(atan2(Wy, Wx))),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    mean_wind_direction = (atan2(mean_sin, mean_cos) * 180 / pi + 360) %% 360
+  )
+
+filtered_wind_data <- wind_data %>%
+  group_by(label) %>%
+  filter(n() >= 5) %>%
+  mutate(
+    trip_count = n(),
+    circular_direction = circular(mean_wind_direction, units = "degrees", template = "none")
+  ) %>%
+  summarise(
+    sd = sd.circular(circular_direction),
+    trip_count = first(trip_count),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(sd))
+
+get_color_category <- function(label, trip_count) {
+  if (label %in% c("K22G25", "K20F33", "K19F30")) {
+    return(label)
+  } else if (trip_count <= 10) {
+    return("low")
+  } else if (trip_count < 20) {
+    return("medium")
+  } else {
+    return("high")
+  }
+}
+
+filtered_wind_data <- filtered_wind_data %>%
+  mutate(color_category = mapply(get_color_category, label, trip_count))
+
+sd_barplot <- ggplot(filtered_wind_data, 
+       aes(x = reorder(label, -sd), y = sd, fill = color_category)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  scale_fill_manual(values = c("K22G25" = "#90EE90", "K20F33" = "#87CEFA", "K19F30" = "darkgoldenrod1",
+                               "low" = "#D3D3D3", "medium" = "#D3D3D3", "high" = "#D3D3D3")) +
+  theme_minimal(base_size = 30) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 20, family = "Arial"),
+    axis.text.y = element_text(size = 30, family = "Arial"),
+    axis.title.x = element_text(size = 30, family = "Arial", margin = margin(t = 20)),
+    axis.title.y = element_text(size = 30, family = "Arial", margin = margin(r = 20)),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "none",
+    plot.title = element_text(size = 30, family = "Arial"),
+    plot.subtitle = element_text(size = 30, family = "Arial")
+  ) +
+  labs(
+    title = "Circular Standard Deviation of Wind Direction by Individual",
+    x = "Individual ID",
+    y = "Circular Standard Deviation"
+  ) +
+  scale_y_continuous(
+    limits = c(0, max(filtered_wind_data$sd) * 1.1),
+    breaks = seq(0, max(filtered_wind_data$sd), length.out = 5),
+    labels = function(x) sprintf("%.2f", x)
+  )
+
+create_circular_chart <- function(data, individual, color) {
+  individual_data <- data %>% 
+    filter(label == individual) %>%
+    mutate(
+      mean_wind_speed = pmin(mean_wind_speed, 12)
+    ) %>%
+    filter(!is.na(mean_wind_speed), !is.na(mean_wind_direction))
+  
+  ggplot(individual_data, aes(x = mean_wind_direction, y = mean_wind_speed)) +
+    geom_point(color = color, alpha = 0.8, size = 6) +
+    coord_polar(start = 0) +
+    scale_x_continuous(breaks = seq(0, 315, by = 45),
+                       labels = c("N", "NE", "E", "SE", "S", "SW", "W", "NW"),
+                       limits = c(0, 360)) +
+    scale_y_continuous(limits = c(0, 12),
+                       breaks = seq(0, 12, by = 3),
+                       labels = function(x) sprintf("%.0f", x)) +
+    labs(title = individual) +
+    theme_minimal(base_size = 16, base_family = "Arial") +
+    theme(
+      axis.text.x = element_text(size = 30, face = "bold", family = "Arial"),
+      axis.text.y = element_text(size = 30, family = "Arial"),
+      axis.title = element_blank(),
+      plot.title = element_text(hjust = 0.5, size = 30, family = "Arial")
+    ) +
+    annotate("text", x = 90, y = 12.6,
+             label = "Wind Speed (m/s)", size = 6, family = "Arial", fontface = "bold")
+}
+
+p1 <- create_circular_chart(wind_data, "K22G25", "#90EE90")
+p2 <- create_circular_chart(wind_data, "K20F33", "#87CEFA")
+p3 <- create_circular_chart(wind_data, "K19F30", "darkgoldenrod1")
+
+combined_circular <- p1 + p2 + p3 + plot_layout(ncol = 3)
+print(combined_circular)
+sd_barplot
+
+ggsave("~/Documents/yodalab/paper/JAB/figure/circular_charts_combined.png", combined_circular, width = 18, height = 8, dpi = 600)
+ggsave("~/Documents/yodalab/paper/JAB/figure/sd_barplot.png", sd_barplot, width = 18, height = 12, dpi = 600)
+```
+
+#Figure2 World map
+```{r}
+world_sf <- ne_countries(scale = "medium", returnclass = "sf")
+x_range <- c(120, 155)
+y_range <- c(25, 55)
+location_nest_data <- data.frame(lon = 141.5576031, lat = 40.5386062)
+map_plot <- ggplot() +
+  geom_sf(data = world_sf, fill = "black", color = "black") +
+  geom_rect(aes(xmin = 141.1705, xmax = 143.0207, ymin = 39.5, ymax = 42),
+            color = "steelblue4", fill = "steelblue4", alpha = 0.2, inherit.aes = FALSE) +
+  theme_classic(base_family = "Arial") +
+  labs(x = "Latitude", y = "Longitude") +
+  annotation_scale(location = "br", width_hint = 0.25) +
+  coord_sf(xlim = x_range, ylim = y_range, expand = FALSE)
+map_plot
+ggsave(file = "~/Documents/yodalab/paper/JAB/figure/map.png", plot = map_plot, dpi=300)
+```
+
+#Figure2A All trips
+```{r}
+japan_sf <- ne_countries(scale = "medium", country = "Japan", returnclass = "sf")
+
+x_range <- c(141.1705, 143.0207)
+y_range <- c(39.5, 42)
+
+create_distance_circle <- function(center_point, radius_km, points = 100) {
+  angles <- seq(0, 360, length.out = points)
+  circle_points <- destPoint(p = c(center_point[1], center_point[2]), 
+                           b = angles, 
+                           d = radius_km * 1000)
+  circle_points <- rbind(circle_points, circle_points[1,])
+  
+  return(data.frame(
+    lon = circle_points[,1],
+    lat = circle_points[,2]
+  ))
+}
+
+nest_center <- c(
+  lon = location_nest_data$lon[1],
+  lat = location_nest_data$lat[1]
+)
+
+circle_30km <- create_distance_circle(nest_center, 30)
+circle_60km <- create_distance_circle(nest_center, 60)
+circle_90km <- create_distance_circle(nest_center, 90)
+
+sea_plot <- ggplot() +
+  geom_sf(data = japan_sf, fill = "black", color = "black") +
+  geom_point(data = all_sea_data, aes(x = lon, y = lat), 
+             size = 0.4, color = "steelblue4") +
+  geom_path(data = circle_30km, aes(x = lon, y = lat), 
+            color = "black", linetype = "solid", size = 0.3) +
+  geom_path(data = circle_60km, aes(x = lon, y = lat), 
+            color = "black", linetype = "solid", size = 0.3) +
+  geom_path(data = circle_90km, aes(x = lon, y = lat), 
+            color = "black", linetype = "solid", size = 0.3) +
+  geom_point(data = location_nest_data, aes(x = lon, y = lat), 
+             color = "darkgoldenrod1", size = 3) +
+  coord_sf(xlim = x_range, ylim = y_range, expand = FALSE) +
+  labs(x = "Longitude", y = "Latitude") +
+  theme_classic(base_family = "Arial") +
+  theme(
+        title = element_text(size = 10),
+        legend.text = element_text(size = 18),
+        legend.title = element_text(size = 18),
+        text = element_text(size = 18),
+        axis.title.x = element_text(size = 18),
+        axis.title.y = element_text(size = 18),
+        plot.title = element_text(size = 18),
+        axis.text = element_text(size = 18))
+
+ggsave(file = "~/Documents/yodalab/paper/JAB/figure/seamap.png", 
+       plot = sea_plot, 
+       width = 10, height = 8, dpi = 600)
+
+sea_plot 
+```
+
+#Figure2C wind compensation scatter plot
+```{r}
+sc_plot <- ggplot(all_sea_data, aes(x = wind_cross, y = α)) +
+  geom_point(size = 2, shape=21, alpha=0.5, color = "steelblue4") +
+  geom_smooth(method = lm, se = FALSE, size = 1, color = "black") +
+  labs(x = "Crosswind (m/s)", y = "Instanatneous deflection (°/5min)") +
+  theme_classic() +
+  theme(aspect.ratio = 1.4,
+        title = element_text(size = 10),
+        legend.text = element_text(size = 18),
+        legend.title = element_text(size = 18),
+        text = element_text(size = 13),
+        axis.title.x = element_text(size = 12),
+        axis.title.y = element_text(size = 12),
+        plot.title = element_text(size = 20),
+        axis.text = element_text(size = 10))
+
+sc_plot
+
+ggsave(file = "~/Documents/yodalab/paper/JAB/figure/scplot.png", plot = sc_plot, dpi=800)
+```
+
+#Figure2B trip with wind
+```{r}
+dir.create("~/Documents/yodalab/figure/trip_with_wind/", recursive = TRUE, showWarnings = FALSE)
+
+location_nest_data <- data.frame(lon = 141.5576031, lat = 40.5386062)
+
+japan_sf <- ne_countries(scale = "medium", country = "Japan", returnclass = "sf")
+
+# Fuction to calculate wind speed and direction
+calculate_wind <- function(Wx, Wy) {
+  wind_speed <- sqrt(Wx^2 + Wy^2)
+  wind_direction <- atan2(Wy, Wx)
+  return(list(speed = wind_speed, direction = wind_direction))
+}
+
+trip_ids <- unique(all_sea_data$ID)
+
+for(trip_id in trip_ids) {
+  current_trip <- all_sea_data[all_sea_data$ID == trip_id, ]
+  
+  wind_calc <- calculate_wind(current_trip$Wx, current_trip$Wy)
+  current_trip$wind_speed <- wind_calc$speed
+  current_trip$wind_direction <- wind_calc$direction
+  
+  p <- ggplot() +
+    geom_sf(data = japan_sf, fill = "black", color = "black") +
+    geom_path(data = current_trip, 
+              aes(x = lon, y = lat),
+              size = 0.5, 
+              color = "steelblue4") +
+    geom_segment(data = current_trip,
+                aes(x = lon, 
+                    y = lat,
+                    xend = lon + (Wx/wind_speed) * 0.1,
+                    yend = lat + (Wy/wind_speed) * 0.1,
+                    color = wind_speed),
+                arrow = arrow(length = unit(0.2, "cm")),
+                size = 0.5) +
+    geom_point(data = location_nest_data,
+               aes(x = lon, y = lat),
+               color = "darkgoldenrod1",
+               size = 3) +
+    coord_sf(xlim = c(141.1, 144.5),
+            ylim = c(39.5, 42),
+            expand = FALSE) +
+    scale_color_viridis_c(name = "Wind Speed (m/s)",
+                         option = "viridis") +
+    labs(x = "Longitude",
+         y = "Latitude",
+         title = paste("Trip ID:", trip_id),
+         subtitle = "Wind direction and speed") +
+    
+    annotation_scale(location = "br", width_hint = 0.25) +
+    
+    theme_classic(base_family = "Arial") +
+        theme(
+      plot.title = element_text(size = 12),
+      axis.title = element_text(size = 14, face = "bold"),
+      axis.text = element_text(size = 12),
+      legend.title = element_text(size = 12),
+      legend.text = element_text(size = 10),
+      panel.grid.minor = element_blank(),
+      plot.background = element_rect(fill = "white"),
+      legend.background = element_rect(fill = "white"),
+      legend.key = element_rect(color = NA)
+    )
+  
+  filename <- paste0("~/Documents/yodalab/paper/JAB/figure/trip/trip_", trip_id, ".png")
+  
+  ggsave(filename, 
+         plot = p, 
+         width = 10, 
+         height = 8, 
+         dpi = 500)
+  
+  cat(sprintf("Saved plot for trip %s\n", trip_id))
+}
+
+all_sea_data$time <- with_tz(all_sea_data$time, "Japan")
+check <- filter(all_sea_data, ID == "2013_9A66331_6_trip")
+check <- check %>% 
+  mutate(wind_speed = sqrt(Wx^2 + Wy^2))
+view(check)
+```
+
+#Figure5 Model results and hierarchical structure of wind drift compensation
+```{r}
+TARGET_AGE <- 21
+TARGET_BIRD_NAME <- "K19C99"
+
+all_sea_data <- read_csv("~/Documents/yodalab/data/01_Output/all_sea_data_allinfo.csv")
+
+fit_dist <- readRDS("~/Documents/yodalab/data/02_Output/StanResult_dist_forpaper.rds")
+
+a_params <- rstan::extract(fit_dist)$a          # age(population) level slope
+a_bird_params <- rstan::extract(fit_dist)$a_Bird # individual level slope
+a_trip_params <- rstan::extract(fit_dist)$a_Trip # trip level slope
+d_trip_params <- rstan::extract(fit_dist)$d_Trip # trip level intercept
+c_param <- rstan::extract(fit_dist)$c
+c2_param <- rstan::extract(fit_dist)$c2
+e_param <- rstan::extract(fit_dist)$e
+
+all_sea_data <- all_sea_data[!is.na(all_sea_data$age) &
+                              !is.na(all_sea_data$α) &
+                              !is.na(all_sea_data$wind_cross), ]
+
+all_sea_data$Nest_Distance <- as.vector(scale(all_sea_data$Nest_Distance))
+
+original_min_age <- min(all_sea_data$age, na.rm = TRUE)
+all_sea_data$age <- all_sea_data$age - original_min_age + 1
+
+print(paste("TARGET_AGE", TARGET_AGE, "→ after adjust", TARGET_AGE - original_min_age + 1))
+
+all_sea_data <- all_sea_data %>%
+  mutate(year_foot = paste(year, foot, sep = "_"))
+
+unique_bird_age <- all_sea_data %>%
+  dplyr::select(year_foot, age) %>%
+  distinct() %>%
+  arrange(year_foot)
+
+Age_ID <- unique_bird_age$age
+
+unique_trip_bird <- all_sea_data %>%
+  dplyr::select(ID, year_foot) %>%
+  distinct() %>%
+  arrange(ID) %>%
+  left_join(unique_bird_age %>% mutate(bird_index = row_number()), by = "year_foot")
+
+Bird_ID <- unique_trip_bird$bird_index
+Trip_ID <- as.integer(as.factor(all_sea_data$ID))
+
+data_list_sea <- list(
+  N = nrow(all_sea_data),
+  N_Age = max(all_sea_data$age),
+  N_Bird = length(unique(all_sea_data$year_foot)),
+  N_Trip = length(unique(all_sea_data$ID)),
+  alpha = as.vector(all_sea_data$α),
+  Nest_Distance = as.vector(all_sea_data$Nest_Distance),
+  wind_cross = as.vector(all_sea_data$wind_cross),
+  Age_ID = Age_ID,
+  Bird_ID = Bird_ID,
+  Trip_ID = Trip_ID,
+  day_night = as.vector(all_sea_data$day_night)
+)
+
+correct_id_mapping <- data.frame(
+  row_number = 1:nrow(all_sea_data),
+  original_ID = all_sea_data$ID,
+  Trip_ID = data_list_sea$Trip_ID,
+  age = all_sea_data$age,
+  label = all_sea_data$label,
+  year_foot = all_sea_data$year_foot,
+  alpha = data_list_sea$alpha,
+  wind_cross = data_list_sea$wind_cross,
+  nest_distance = data_list_sea$Nest_Distance
+)
+
+bird_id_mapping <- unique_bird_age %>%
+  mutate(bird_index = row_number()) %>%
+  dplyr::select(year_foot, bird_index)
+
+target_age_adjusted <- TARGET_AGE - original_min_age + 1
+age_data <- correct_id_mapping %>% 
+  filter(age == target_age_adjusted) %>%
+  left_join(bird_id_mapping, by = "year_foot")
+
+bird_summary <- age_data %>%
+  group_by(label, bird_index) %>%
+  summarise(data_points = n(), trips = n_distinct(original_ID), .groups = 'drop') %>%
+  arrange(desc(data_points), desc(trips))
+
+if (!TARGET_BIRD_NAME %in% bird_summary$label) {
+  stop(paste(TARGET_BIRD_NAME, "was not found in age", TARGET_AGE))
+}
+
+print("=== individual data ===")
+for(i in 1:min(10, nrow(bird_summary))) {
+  print(paste(sprintf("%2d", i), ": ", bird_summary$label[i],
+              " (Bird_ID:", bird_summary$bird_index[i],
+              ", data:", bird_summary$data_points[i],
+              ", trip:", bird_summary$trips[i], ")"))
+}
+
+c_mean <- mean(c_param)
+c2_mean <- mean(c2_param)
+e_mean <- mean(e_param)
+
+calculate_trip_coefficient <- function(trip_id_stan, distance_median, light_fixed = 1) {
+  if(trip_id_stan > 0 && trip_id_stan <= ncol(a_trip_params)) {
+    a_trip_mean <- mean(a_trip_params[, trip_id_stan])
+    d_trip_mean <- mean(d_trip_params[, trip_id_stan])
+    
+    coefficient <- a_trip_mean + (c_mean * distance_median) +
+                  (c2_mean * distance_median^2) + (e_mean * light_fixed)
+    
+    return(list(coef = coefficient, intercept = d_trip_mean, valid = TRUE))
+  } else {
+    return(list(coef = NA, intercept = NA, valid = FALSE))
+  }
+}
+
+calculate_individual_coefficient_with_bird <- function(bird_index, bird_data,
+                                                       a_bird_params, d_trip_params,
+                                                       c_mean, c2_mean, e_mean) {
+  
+  if(bird_index > 0 && bird_index <= ncol(a_bird_params)) {
+    a_bird_mean <- mean(a_bird_params[, bird_index])
+    bird_trip_ids <- unique(bird_data$Trip_ID)
+    d_bird_mean <- mean(d_trip_params[, bird_trip_ids], na.rm = TRUE)
+    bird_distance <- median(bird_data$nest_distance, na.rm = TRUE)
+    coefficient <- a_bird_mean + (c_mean * bird_distance) + 
+                  (c2_mean * bird_distance^2) + (e_mean * 1)
+    return(list(coef = coefficient, intercept = d_bird_mean, valid = TRUE))
+  } else {
+    return(list(coef = NA, intercept = NA, valid = FALSE))
+  }
+}
+
+# Population Level（blue）
+pop_distance <- median(age_data$nest_distance, na.rm = TRUE)
+age_index <- target_age_adjusted
+
+pop_a_mean <- mean(a_params[, age_index])
+pop_d_mean <- 0
+
+pop_coefficient <- pop_a_mean + (c_mean * pop_distance) + 
+                  (c2_mean * pop_distance^2) + (e_mean * 1)
+
+pop_wind_range <- range(age_data$wind_cross, na.rm = TRUE)
+pop_wind_seq <- seq(pop_wind_range[1], pop_wind_range[2], length.out = 100)
+
+pred_population <- data.frame(
+  wind_cross = pop_wind_seq,
+  predicted_alpha = pop_coefficient * pop_wind_seq + pop_d_mean
+)
+
+# Individual Level（orange）- a_Bird
+available_birds_data <- age_data %>%
+  group_by(label, bird_index) %>%
+  summarise(n = n(), .groups = 'drop')
+
+pred_individual <- data.frame()
+
+for(i in 1:nrow(available_birds_data)) {
+  bird_name <- available_birds_data$label[i]
+  bird_idx <- available_birds_data$bird_index[i]
+  bird_data <- age_data %>% filter(label == bird_name)
+  
+  result <- calculate_individual_coefficient_with_bird(
+    bird_idx, bird_data, a_bird_params, d_trip_params,
+    c_mean, c2_mean, e_mean
+  )
+  
+  if(result$valid) {
+    bird_wind_range <- range(bird_data$wind_cross, na.rm = TRUE)
+    bird_wind_seq <- seq(bird_wind_range[1], bird_wind_range[2], length.out = 50)
+    
+    bird_pred <- data.frame(
+      wind_cross = bird_wind_seq,
+      predicted_alpha = result$coef * bird_wind_seq + result$intercept,
+      bird = bird_name,
+      is_target = bird_name == TARGET_BIRD_NAME
+    )
+    
+    pred_individual <- rbind(pred_individual, bird_pred)
+  }
+}
+
+# Trip Level（green）
+target_bird_data <- age_data %>% filter(label == TARGET_BIRD_NAME)
+target_trips_stan <- unique(target_bird_data$Trip_ID)
+pred_trip <- data.frame()
+
+for(trip_id_stan in target_trips_stan) {
+  trip_data <- target_bird_data %>% filter(Trip_ID == trip_id_stan)
+  
+  if(nrow(trip_data) >= 3) {
+    trip_distance <- median(trip_data$nest_distance, na.rm = TRUE)
+    result <- calculate_trip_coefficient(trip_id_stan, trip_distance, 1)
+    
+    if(result$valid) {
+      trip_wind_range <- range(trip_data$wind_cross, na.rm = TRUE)
+      trip_wind_seq <- seq(trip_wind_range[1], trip_wind_range[2], length.out = 30)
+      
+      trip_pred <- data.frame(
+        wind_cross = trip_wind_seq,
+        predicted_alpha = result$coef * trip_wind_seq + result$intercept,
+        trip = trip_id_stan
+      )
+      
+      pred_trip <- rbind(pred_trip, trip_pred)
+    }
+  }
+}
+
+available_birds <- sort(unique(age_data$label))
+n_individuals <- length(available_birds)
+n_trips <- length(target_trips_stan)
+
+if(n_individuals <= 8) {
+  individual_colors <- c("#E31A1C", "#FF7F00", "#1F78B4", "#33A02C",
+                         "#6A3D9A", "#FF69B4", "#8B4513", "#FFA500")[1:n_individuals]
+} else if(n_individuals <= 12) {
+  individual_colors <- RColorBrewer::brewer.pal(min(n_individuals, 9), "Set1")
+  if(n_individuals > 9) {
+    additional_colors <- RColorBrewer::brewer.pal(n_individuals - 9, "Set2")
+    individual_colors <- c(individual_colors, additional_colors)
+  }
+} else {
+  individual_colors <- rainbow(n_individuals, s = 0.8, v = 0.8)
+}
+names(individual_colors) <- available_birds
+
+if(n_trips <= 8) {
+  trip_colors <- RColorBrewer::brewer.pal(max(3, n_trips), "Dark2")
+} else {
+  trip_colors <- viridis::viridis(n_trips, alpha = 1, option = "D")
+}
+names(trip_colors) <- as.character(target_trips_stan)
+
+theme_main <- theme_classic(base_family = "Arial") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.title = element_text(size = 28),
+    axis.text = element_text(size = 26),
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),
+    axis.line = element_line(color = "black", linewidth = 1),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+
+# Population Level
+plot1_main <- ggplot(age_data, aes(x = wind_cross, y = alpha)) +
+  geom_point(alpha = 0.4, size = 3, color = "steelblue3") +
+  geom_line(data = pred_population,
+            aes(x = wind_cross, y = predicted_alpha),
+            color = "steelblue4", linewidth = 2.0) +
+  labs(x = "Crosswind (m/s)",
+       y = "Instantaneous deflection\n(°/5min)",
+       title = paste("Population | Age", TARGET_AGE, "| Model-based")) +
+  theme_main +
+  coord_cartesian(xlim = c(-10.5, 10.5), ylim = c(-82, 112))
+
+# Individual Level
+target_individual_data <- age_data %>% filter(label == TARGET_BIRD_NAME)
+other_individual_data <- age_data %>% filter(label != TARGET_BIRD_NAME)
+pred_individual_target <- pred_individual %>% filter(is_target == TRUE)
+pred_individual_others <- pred_individual %>% filter(is_target == FALSE)
+
+plot2_main <- ggplot() +
+  geom_point(data = other_individual_data,
+             aes(x = wind_cross, y = alpha),
+             alpha = 0.3, size = 3, color = "darkorange") +
+  geom_point(data = target_individual_data,
+             aes(x = wind_cross, y = alpha),
+             alpha = 0.6, size = 3, color = "darkorange3") +
+  geom_line(data = pred_individual_others,
+            aes(x = wind_cross, y = predicted_alpha, group = bird),
+            color = "darkorange", linewidth = 2.0, alpha = 0.9) +
+  geom_line(data = pred_individual_target,
+            aes(x = wind_cross, y = predicted_alpha, group = bird),
+            color = "darkorange3", linewidth = 2.0, alpha = 0.9) +
+  labs(x = "Crosswind (m/s)",
+       y = "Instantaneous deflection\n(°/5min)",
+       title = paste("Individual | n =", length(unique(pred_individual$bird)), "birds | Model-based")) +
+  theme_main +
+  coord_cartesian(xlim = c(-10.5, 10.5), ylim = c(-82, 112))
+
+# Trip Level
+plot3_main <- ggplot() +
+  geom_point(data = age_data %>% filter(label != TARGET_BIRD_NAME),
+             aes(x = wind_cross, y = alpha),
+             color = "gray90", alpha = 0.3, size = 3) +
+  geom_point(data = target_bird_data,
+             aes(x = wind_cross, y = alpha),
+             color = "yellowgreen", alpha = 0.4, size = 3) +
+  geom_line(data = pred_trip,
+            aes(x = wind_cross, y = predicted_alpha, group = trip),
+            color = "olivedrab", linewidth = 2.0, alpha = 0.7) +
+  labs(x = "Crosswind (m/s)",
+       y = "Instantaneous deflection\n(°/5min)",
+       title = paste("Trip | Bird:", TARGET_BIRD_NAME, "| n =", length(unique(pred_trip$trip)), "trips | Model-based")) +
+  theme_main +
+  coord_cartesian(xlim = c(-10.5, 10.5), ylim = c(-82, 112))
+
+theme_colored <- theme_classic(base_family = "Arial") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 12),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 11),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9),
+    legend.key.size = unit(0.5, "cm"),
+    legend.position = "right"
+  )
+
+plot_all_individuals <- ggplot() +
+  geom_point(data = age_data,
+             aes(x = wind_cross, y = alpha, color = label),
+             alpha = 0.6, size = 2) +
+  geom_line(data = pred_individual,
+            aes(x = wind_cross, y = predicted_alpha,
+                color = bird, group = bird),
+            linewidth = 2, alpha = 0.8) +
+  scale_color_manual(values = individual_colors, name = "Individual") +
+  labs(x = "Crosswind (m/s)",
+       y = "Instantaneous deflection (°/5min)",
+       title = "All Individuals - ID Mapping Verification",
+       subtitle = paste("Age", TARGET_AGE, "| n =", n_individuals, "individuals | Using a_Bird parameters")) +
+  theme_colored +
+  coord_cartesian(xlim = c(-10.5, 10.5), ylim = c(-82, 112))
+
+if(n_individuals > 10) {
+  plot_all_individuals <- plot_all_individuals +
+    theme(legend.position = "none") +
+    labs(subtitle = paste("Age", TARGET_AGE, "| n =", n_individuals, "individuals | Legend hidden for clarity"))
+}
+
+plot_all_trips <- ggplot() +
+  geom_point(data = age_data %>% filter(label != TARGET_BIRD_NAME),
+             aes(x = wind_cross, y = alpha),
+             color = "gray90", alpha = 0.3, size = 1.5) +
+  geom_point(data = target_bird_data,
+             aes(x = wind_cross, y = alpha, color = factor(Trip_ID)),
+             alpha = 0.7, size = 2.5) +
+  geom_line(data = pred_trip,
+            aes(x = wind_cross, y = predicted_alpha,
+                color = factor(trip), group = trip),
+            linewidth = 3, alpha = 0.9) +
+  scale_color_manual(values = trip_colors, name = "Trip ID") +
+  labs(x = "Crosswind (m/s)",
+       y = "Instantaneous deflection (°/5min)",
+       title = "All Trips - ID Mapping Verification",
+       subtitle = paste("Bird:", TARGET_BIRD_NAME, "| n =", n_trips, "trips | Data points + Model predictions")) +
+  theme_colored +
+  coord_cartesian(xlim = c(-10.5, 10.5), ylim = c(-82, 112))
+
+top_birds <- bird_summary %>%
+  head(5) %>%
+  pull(label)
+
+plot_id_verification <- ggplot() +
+  geom_point(data = age_data %>% filter(label %in% top_birds),
+             aes(x = wind_cross, y = alpha, color = label),
+             alpha = 0.7, size = 2.5) +
+  geom_line(data = pred_individual %>% filter(bird %in% top_birds),
+            aes(x = wind_cross, y = predicted_alpha,
+                color = bird, group = bird),
+            linewidth = 3, alpha = 0.9) +
+  scale_color_manual(values = individual_colors[top_birds], name = "Individual") +
+  labs(x = "Crosswind (m/s)",
+       y = "Instantaneous deflection (°/5min)",
+       title = "ID Mapping Accuracy - Top 5 Individuals",
+       subtitle = "Data points and model predictions should align by color") +
+  theme_colored +
+  coord_cartesian(xlim = c(-10.5, 10.5), ylim = c(-82, 112))
+
+
+main_plot <- plot_grid(plot1_main, plot2_main, plot3_main,
+                      ncol = 1, rel_heights = c(1, 1, 1), align = "v")
+
+colored_plot <- plot_grid(plot_all_individuals, plot_all_trips, plot_id_verification,
+                         ncol = 1, rel_heights = c(1, 1, 1), align = "v")
+
+figure_dir <- "~/Documents/yodalab/paper/JAB/figure"
+if(!dir.exists(figure_dir)) dir.create(figure_dir, recursive = TRUE)
+
+file_main <- paste0("Figure4C_age", TARGET_AGE,"_", TARGET_BIRD_NAME, "_main_aBird")
+ggsave(paste0(figure_dir, "/", file_main, ".png"),
+       main_plot, width = 8, height = 20, units = "in", dpi = 600)
+
+file_colored <- paste0("Figure4C_age", TARGET_AGE, "_", TARGET_BIRD_NAME, "_colored_aBird")
+ggsave(paste0(figure_dir, "/", file_colored, ".png"),
+       colored_plot, width = 10, height = 20, units = "in", dpi = 600)
+
+# プロット表示
+print(main_plot)
+```
+
+#FigureS1 Individual number and avarage trip number
+```{r}
+individual_age_data <- all_sea_data %>%
+  group_by(label, year) %>%
+  summarise(unique_age = first(age), .groups = "drop")
+
+age_summary <- all_sea_data %>%
+  group_by(age) %>%
+  summarise(n_individuals = n_distinct(label))
+
+trips_data <- all_sea_data %>%
+  group_by(age, label) %>%
+  summarise(trips = n_distinct(ID), .groups = "drop") %>%
+  left_join(age_summary %>% dplyr::select(age, n_individuals)) %>%
+  mutate(age_group = factor(age))
+
+age_histogram_modified <- ggplot(all_sea_data, aes(x = age)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "black",
+                 alpha = 1, size = 0.2) +
+  labs(x = "", y = "GPS Points") +
+  theme_minimal(base_family = "Arial", base_size = 18) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 16),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(color = "black", size = 0.2)
+  ) +
+  scale_x_continuous(
+    limits = c(5.5, 27.5),
+    breaks = seq(6, 27, by = 1),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(expand = c(0, 0))
+
+individual_age_plot <- ggplot(individual_age_data, aes(x = unique_age)) +
+  geom_histogram(binwidth = 1, fill = "darkgray", color = "black",
+                 alpha = 1, size = 0.2) +
+  labs(x = "", y = "Individuals") +
+  theme_minimal(base_family = "Arial", base_size = 18) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 16),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(color = "black", size = 0.2)
+  ) +
+  scale_x_continuous(
+    limits = c(5.5, 27.5),
+    breaks = seq(6, 27, by = 1),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(expand = c(0, 0))
+
+p2_modified <- ggplot(trips_data, aes(x = age_group, y = trips)) +
+  geom_boxplot(fill = "white", color = "black", alpha = 0.8) +
+  labs(x = "Age",
+       y = "Number of Trips per Individual") +
+  theme_minimal(base_family = "Arial", base_size = 18) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 16),
+    axis.text.x = element_text(angle = 0),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(color = "black", size = 0.2)
+  ) +
+  scale_x_discrete(limits = as.character(6:27)) +
+  scale_y_continuous(expand = c(0, 0))
+
+combined_figure <- (age_histogram_modified / individual_age_plot / p2_modified) +
+  plot_layout(heights = c(1, 1, 2)) +
+  plot_annotation(
+    tag_levels = 'A',
+    theme = theme(plot.margin = margin(10, 10, 10, 10))
+  )
+
+ggsave(
+  "~/Documents/yodalab/paper/JAB/figure/histogram_and_boxplot.png",
+  combined_figure,
+  width = 12,
+  height = 12,
+  dpi = 300
+)
+print(combined_figure)
+```
+
+#Figure S2 HMM state classification
+```{r}
+# Plot range
+x_range <- c(141.1705, 143.0207)
+y_range <- c(38.82596, 41.48974)
+
+# Read data
+final_data <- read_csv("~/Documents/yodalab/paper/JAB/data/State_Classified/GPS2020.csv")
+
+# Remove rows with missing State
+final_data <- final_data %>%
+  filter(!is.na(State))
+
+# Select only one trip ID
+target_id <- "2020_bird_075_13_trip"
+
+data1 <- final_data %>%
+  filter(ID == target_id)
+
+# Color palette
+my_palette <- c(
+  "Fast_Outbound" = "#E69F00",
+  "Fast_Middle" = "yellowgreen",
+  "Water" = "grey",
+  "Fast_Homing" = "steelblue"
+)
+
+# Japan map
+japan_map <- map_data("world", region = "Japan")
+
+# Output path
+out_place <- "~/Documents/yodalab/paper/JAB/figure/"
+if (!dir.exists(out_place)) dir.create(out_place, recursive = TRUE)
+
+# Make plot
+plot <- ggplot() +
+  geom_polygon(
+    data = japan_map,
+    aes(x = long, y = lat, group = group),
+    fill = "black",
+    color = "black"
+  ) +
+  geom_path(
+    data = data1,
+    aes(x = lon, y = lat),
+    color = "snow2",
+    linewidth = 1.2,
+    alpha = 0.7
+  ) +
+  geom_point(
+    data = data1,
+    aes(x = lon, y = lat, color = State),
+    size = 1.2
+  ) +
+  coord_cartesian(xlim = x_range, ylim = y_range) +
+  theme_void() +
+  scale_color_manual(values = my_palette)
+
+# Save plot
+ggsave(
+  filename = paste0(out_place, "map_", target_id, ".png"),
+  plot = plot,
+  dpi = 800,
+  width = 6,
+  height = 6
+)
+
+plot
+```
+
+#FigureS3 Calculate the point(distance from the nest) that shift the distance effect
+```{r}
+all_sea_data <- read_csv("~/Documents/yodalab/paper/JAB/data/not_for_upload/data_for_stan.csv")
+
+all_sea_data <- all_sea_data[!is.na(all_sea_data$age) & 
+                             !is.na(all_sea_data$α) & 
+                             !is.na(all_sea_data$wind_cross), ]
+
+location_nest_data <- data.frame(lon = 141.5576031, lat = 40.5386062)
+
+scaled_data <- scale(all_sea_data$Nest_Distance)
+mean_value <- attr(scaled_data, "scaled:center")
+sd_value <- attr(scaled_data, "scaled:scale")
+
+#Define quadratic function rom stan result
+a <- 0.17
+b <- -0.24
+# solve dy/dx = 2ax + b
+x_critical_std <- -b / (2 * a)
+x_critical_orig <- x_critical_std * sd_value + mean_value
+x_vals_std <- seq(-2, 3, length.out = 300)
+x_vals_orig <- x_vals_std * sd_value + mean_value
+x_vals_orig_km <- x_vals_orig / 1000
+x_critical_orig_km <- x_critical_orig / 1000
+show(x_critical_orig_km)
+
+###Calculated the original distance of shifting negative to positive effect of distance
+
+y_vals <- a * x_vals_std^2 + b * x_vals_std
+
+slopes <- 2 * a * x_vals_std + b
+
+df <- data.frame(
+  x = x_vals_orig_km,
+  y = y_vals, 
+  color = ifelse(slopes < 0, "yellowgreen", "steelblue4")
+)
+effect <- ggplot(df, aes(x = x, y = y, color = color)) +
+  geom_line(size = 3) +  
+  scale_color_identity() + 
+  geom_vline(xintercept = x_critical_orig_km, linetype = "dashed", color = "black") +
+    scale_x_continuous(
+    limits = c(0, 120),  
+    expand = c(0.02, 0)
+  ) +
+  theme_classic(base_family = "Arial", base_size=24) +
+  theme(
+    axis.text = element_text(size = 30),
+    axis.title = element_text(size = 30),
+    plot.title = element_text(size = 30),
+    axis.line = element_line(color = "black", size = 1)
+  )
+  labs(title = expression(y == 0.17*x^2 - 0.24*x),
+       x = "Nest distance (km)", y = "y")
+ggsave("~/Documents/yodalab/paper/JAB/figure/distanceeffect.png", 
+       plot = effect, 
+       width = 12, height = 16, dpi = 600)
+
+japan_sf <- ne_countries(scale = "medium", country = "Japan", returnclass = "sf")
+
+x_range <- c(141.1705, 143.0207)
+y_range <- c(39.5, 42)
+
+#Function to create circle in the map
+create_distance_circle <- function(center_point, radius_km, points = 100) {
+  angles <- seq(0, 360, length.out = points)
+  circle_points <- destPoint(p = c(center_point[1], center_point[2]), 
+                           b = angles, 
+                           d = radius_km * 1000)
+  circle_points <- rbind(circle_points, circle_points[1,])
+  
+  return(data.frame(
+    lon = circle_points[,1],
+    lat = circle_points[,2]
+  ))
+}
+
+nest_center <- c(
+  lon = location_nest_data$lon[1],
+  lat = location_nest_data$lat[1]
+)
+
+circle_30km <- create_distance_circle(nest_center, 30)
+circle_60km <- create_distance_circle(nest_center, 60)
+circle_75km <- create_distance_circle(nest_center, 59.8)
+
+all_sea_data <- all_sea_data %>%
+  mutate(
+    distance_km = distGeo(
+      matrix(c(lon, lat), ncol = 2),
+      matrix(c(location_nest_data$lon[1], location_nest_data$lat[1]), ncol = 2)
+    ) / 1000,
+    point_color = ifelse(distance_km <= 59.8, "yellowgreen", "steelblue4")
+  )
+
+sea_plot <- ggplot() +
+  geom_sf(data = japan_sf, fill = "black", color = "black") +
+  geom_point(data = all_sea_data, aes(x = lon, y = lat), 
+             size = 1, color = all_sea_data$point_color) +
+  # geom_path(data = circle_30km, aes(x = lon, y = lat), 
+  #           color = "black", linetype = "solid", size = 0.3) +
+  # geom_path(data = circle_60km, aes(x = lon, y = lat), 
+  #           color = "black", linetype = "solid", size = 0.3) +
+  geom_path(data = circle_75km, aes(x = lon, y = lat), 
+            color = "black", linetype = "solid", size = 0.3) +
+  geom_point(data = location_nest_data, aes(x = lon, y = lat), 
+             color = "darkgoldenrod1", size = 4) +
+  coord_sf(xlim = x_range, ylim = y_range, expand = FALSE) +
+  labs(x = "Longitude", y = "Latitude") +
+  theme_classic(base_family = "Arial") +
+    theme(
+    axis.title = element_text(size = 24),
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(size = 24, family = "Arial"),
+    plot.title = element_text(size = 24),
+    axis.line = element_line(color = "black", size = 1)
+  ) 
+
+arrival_points <- all_sea_data %>%
+  group_by(ID) %>%
+  slice_tail(n = 1) %>%
+  ungroup()
+
+histogram_data <- arrival_points %>%
+  mutate(lat_bin = cut(lat, 
+                      breaks = seq(39.5, 42.0, by = 0.1),
+                      include.lowest = TRUE)) %>%
+  count(lat_bin) %>%
+  mutate(lat_mid = as.numeric(sub("\\((.+),.*", "\\1", lat_bin)) + 0.05)
+
+hist_plot <- ggplot(histogram_data, aes(y = lat_mid, x = n)) + 
+  geom_segment(
+    aes(xend = n, yend = lat_mid, x = 0, y = lat_mid),
+    color = "gray",
+    size = 6
+  ) +
+  theme_classic(base_size = 24) +
+  theme(
+    axis.title = element_text(size = 24),
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(size = 24, family = "Arial"),
+    plot.title = element_text(size = 24),
+    axis.line = element_line(color = "black", size = 1)
+  ) +
+  scale_y_continuous(
+    limits = y_range,
+    breaks = seq(39.5, 42.0, by = 0.5),
+    labels = function(x) sprintf("%.1f", x)
+  )
+
+combined_plot <- sea_plot + hist_plot + 
+  plot_layout(widths = c(3, 1))
+
+ggsave("~/Documents/yodalab/paper/JAB/figure/combined_plots.png", 
+       plot = combined_plot, 
+       width = 16, height = 12, dpi = 600)
+
+combined_plot
+```
+
+#FigureS5 Tailwind, Crossind age effect
+Linear mixed models with linear age effect
+```{r}
+trip_wind <- all_sea_data %>%
+  group_by(ID, foot, age) %>%
+  summarise(
+    mean_tailwind  = mean(wind_back,  na.rm = TRUE),
+    mean_crosswind = mean(wind_cross, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(
+    is.finite(age),
+    is.finite(mean_tailwind),
+    is.finite(mean_crosswind)
+  )
+
+# models
+m_tail  <- lmer(mean_tailwind  ~ age + (1 | foot), data = trip_wind, REML = FALSE)
+m_cross <- lmer(mean_crosswind ~ age + (1 | foot), data = trip_wind, REML = FALSE)
+
+pred_tail <- ggeffects::ggpredict(m_tail,  terms = "age [all]", type = "fixed") %>%
+  as.data.frame() %>%
+  mutate(response = "Tailwind")
+
+pred_cross <- ggeffects::ggpredict(m_cross, terms = "age [all]", type = "fixed") %>%
+  as.data.frame() %>%
+  mutate(response = "Crosswind")
+
+pred_df <- bind_rows(pred_tail, pred_cross)
+
+plot_df <- trip_wind %>%
+  select(age, mean_tailwind, mean_crosswind) %>%
+  pivot_longer(
+    cols = c(mean_tailwind, mean_crosswind),
+    names_to = "response",
+    values_to = "wind"
+  ) %>%
+  mutate(
+    response = recode(
+      response,
+      mean_tailwind = "Tailwind",
+      mean_crosswind = "Crosswind"
+    )
+  )
+
+g <- ggplot(plot_df, aes(x = age, y = wind)) +
+  geom_point(alpha = 0.35, size = 2, color = "steelblue") +
+  geom_ribbon(
+    data = pred_df,
+    aes(x = x, ymin = conf.low, ymax = conf.high),
+    inherit.aes = FALSE,
+    alpha = 0.20
+  ) +
+  geom_line(
+    data = pred_df,
+    aes(x = x, y = predicted),
+    inherit.aes = FALSE,
+    linewidth = 1
+  ) +
+  facet_wrap(~response, ncol = 2, scales = "free_y") +
+  labs(
+    x = "Age",
+    y = "Average wind component per trip (m/s)"
+  ) +
+  theme_classic(base_size = 20) +
+    theme_classic(base_size = 30) +
+  theme(
+    axis.title = element_text(size = 30),
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(size = 30, family = "Arial"),
+    plot.title = element_text(size = 30),
+    axis.line = element_line(color = "black", size = 1),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 36, face = "bold"),
+    panel.spacing = unit(1.2, "lines")
+  )
+
+ggsave("~/Documents/yodalab/paper/JAB/figure/wind_diffe.png", 
+       plot = g, 
+       width = 24, height = 12, dpi = 600)
+
+extract_age_stats <- function(model, response_name) {
+  s <- summary(model)
+  data.frame(
+    Response = response_name,
+    Beta = coef(s)["age", "Estimate"],
+    SE = coef(s)["age", "Std. Error"],
+    DF = coef(s)["age", "df"],
+    t = coef(s)["age", "t value"],
+    p = coef(s)["age", "Pr(>|t|)"],
+    row.names = NULL
+  )
+}
+
+stats_table <- bind_rows(
+  extract_age_stats(m_tail, "Tailwind"),
+  extract_age_stats(m_cross, "Crosswind")
+) %>%
+  mutate(
+    Beta = round(Beta, 3),
+    SE   = round(SE, 3),
+    DF   = round(DF, 1),
+    t    = round(t, 3),
+    p    = ifelse(p < 0.001, "< 0.001", sprintf("%.3f", p))
+  )
+
+print(stats_table)
+
+cat("\nSimple results:\n")
+for (i in seq_len(nrow(stats_table))) {
+  cat(
+    sprintf(
+      "%s: beta = %s ± %s SE, t = %s, df = %s, p = %s\n",
+      stats_table$Response[i],
+      stats_table$Beta[i],
+      stats_table$SE[i],
+      stats_table$t[i],
+      stats_table$DF[i],
+      stats_table$p[i]
+    )
+  )
+}
+```

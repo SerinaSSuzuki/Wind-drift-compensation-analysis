@@ -1,0 +1,609 @@
+---
+title: "HMM2"
+output: html_document
+date: "2023-09-12"
+---
+HMM classification cannot classify all IDs in a single run.
+It is necessary to run the classification multiple times and verify
+that all IDs have been successfully assigned a state.
+Run this script as a continuation of New5_HMM1.Rmd.
+
+Back to Code2A_HMM1.Rmd's #8. HMM State Classification and # 7. Function to remove consecutive duplicate GPS points Chunk if you accidentally removed the function
+
+#2nd round
+#14. read GPS data before running HMM
+```{r}
+#14. read GPS data before running HMM
+
+years <- c(2013)
+# years <- 2013:2022
+
+base_path <- "~/Documents/yodalab/paper/JAB/data/not_for_upload/"
+hmm_path <- paste0(base_path, "HMM_added/")
+input_path <- paste0(hmm_path, "input/")
+processed_path <- paste0(hmm_path, "processed/")
+unprocessed_path <- paste0(hmm_path, "unprocessed/")
+output_path <- paste0(hmm_path, "output/")
+trip_path <- paste0(hmm_path, "trip/")
+
+dir.create(processed_path, showWarnings = FALSE, recursive = TRUE)
+dir.create(unprocessed_path, showWarnings = FALSE, recursive = TRUE)
+dir.create(output_path, showWarnings = FALSE, recursive = TRUE)
+dir.create(trip_path, showWarnings = FALSE, recursive = TRUE)
+
+read_gps_year <- function(yr) {
+  
+  gps_files <- list.files(
+    path = input_path,
+    pattern = paste0("^GPS", yr, "(_[0-9]+)?\\.csv$"),
+    full.names = TRUE
+  )
+  
+  gps_files <- sort(gps_files)
+  
+  if (length(gps_files) == 0) {
+    stop(paste0("No GPS files found for ", yr))
+  }
+  
+  message("Reading GPS files for ", yr, ": ",
+          paste(basename(gps_files), collapse = ", "))
+  
+  read_csv(gps_files, show_col_types = FALSE)
+}
+
+for (yr in years) {
+  assign(
+    paste0("GPS", yr),
+    read_gps_year(yr),
+    envir = .GlobalEnv
+  )
+}
+```
+
+#15. read HMM classified data
+```{r}
+#15. read HMM classified data
+
+read_hmm_year <- function(yr) {
+  
+  hmm_files <- list.files(
+    path = hmm_path,
+    pattern = paste0("^HMM_GPS", yr, "(_[0-9]+)?\\.csv$"),
+    full.names = TRUE
+  )
+  
+  hmm_files <- sort(hmm_files)
+  
+  if (length(hmm_files) == 0) {
+    stop(paste0("No HMM files found for ", yr))
+  }
+  
+  message("Reading HMM files for ", yr, ": ",
+          paste(basename(hmm_files), collapse = ", "))
+  
+  read_csv(hmm_files, show_col_types = FALSE)
+}
+
+for (yr in years) {
+  assign(
+    paste0("HMM", yr),
+    read_hmm_year(yr),
+    envir = .GlobalEnv
+  )
+}
+```
+
+#16. Match states to GPS data
+After this step, the State column for each ID will contain:
+  - Success: one of the 4 states (Fast_Outbound, Fast_Middle,
+             Fast_Homing, Slow), with NA only at the last point
+  - Failure: NA for all points
+```{r}
+update_state <- function(gps_df, hmm_df) {
+  
+  # If GPS data does not have State column yet, create it
+  if (!"State" %in% colnames(gps_df)) {
+    gps_df$State <- NA_character_
+  }
+  
+  # Prepare HMM state data
+  # Use time_key to avoid problems caused by different time formats
+  hmm_state <- hmm_df %>%
+    dplyr::select(ID, time, State) %>%
+    mutate(time_key = as.character(time)) %>%
+    dplyr::select(ID, time_key, State_new = State) %>%
+    distinct(ID, time_key, .keep_all = TRUE)
+  
+  # Keep existing State, and replace it only when new HMM State exists
+  gps_updated <- gps_df %>%
+    mutate(time_key = as.character(time)) %>%
+    left_join(hmm_state, by = c("ID", "time_key")) %>%
+    mutate(
+      State = ifelse(
+        !is.na(State_new),
+        State_new,
+        State
+      )
+    ) %>%
+    dplyr::select(-time_key, -State_new)
+  
+  return(gps_updated)
+}
+
+for (yr in years) {
+  
+  gps_name <- paste0("GPS", yr)
+  hmm_name <- paste0("HMM", yr)
+  
+  gps_df <- get(gps_name)
+  hmm_df <- get(hmm_name)
+  
+  updated_df <- update_state(gps_df, hmm_df)
+  
+  assign(gps_name, updated_df, envir = .GlobalEnv)
+}
+```
+
+#17. Output
+In case your laptop will die
+```{r}
+for (yr in years) {
+  gps_name <- paste0("GPS", yr)
+  
+  write_csv(
+    get(gps_name),
+    paste0(processed_path, gps_name, ".csv")
+  )
+}
+```
+
+
+#18 Define the function extract_unclassified_data
+Extract all IDs whose State column contains only NA values and combine
+them into a single data frame. This process is repeated until all IDs
+have been successfully classified.
+```{r}
+extract_unclassified_data <- function(years, threshold, output_name) {
+  
+  unclassified_data <- tibble()
+  
+  for (yr in years) {
+    
+    gps_name <- paste0("GPS", yr)
+    final_data <- get(gps_name)
+    
+    # Check IDs where all State values are NA
+    all_na_id <- final_data %>%
+      group_by(ID) %>%
+      summarise(
+        all_na = all(is.na(State)),
+        .groups = "drop"
+      ) %>%
+      filter(all_na)
+    
+    message("IDs with all State = NA in ", gps_name, ":")
+    print(all_na_id)
+    
+    # Extract IDs where the proportion of NA State is above the threshold
+    again_id <- final_data %>%
+      group_by(ID) %>%
+      summarise(
+        na_ratio = mean(is.na(State)),
+        .groups = "drop"
+      ) %>%
+      filter(na_ratio > threshold)
+    
+    again_data <- semi_join(final_data, again_id, by = "ID") %>%
+      dplyr::select(-any_of("State"))
+    
+    unclassified_data <- bind_rows(unclassified_data, again_data)
+  }
+  
+  write_csv(
+    unclassified_data,
+    paste0(unprocessed_path, output_name, ".csv")
+  )
+  
+  write_csv(
+    unclassified_data,
+    paste0(input_path, output_name, ".csv")
+  )
+  
+  return(unclassified_data)
+}
+```
+
+#19 Extract unclassified data
+```{r}
+data_again <- extract_unclassified_data(
+  years = years,
+  threshold = 0.5,
+  output_name = "data_again"
+)
+```
+
+#20. Split data into smaller chunks
+The dataset is split because processing the full dataset at once
+causes the computer to run out of memory.
+```{r}
+if (nrow(data_again) == 0) {
+  stop("All IDs were classified. No need to run HMM again.")
+}
+
+split_size <- nrow(data_again) %/% 2
+
+data_again_1 <- data_again[1:split_size, ]
+data_again_2 <- data_again[(split_size + 1):nrow(data_again), ]
+
+write_csv(data_again_1, paste0(input_path, "data_again_1.csv"))
+write_csv(data_again_2, paste0(input_path, "data_again_2.csv"))
+```
+
+
+
+#21. HMM State Classification (2nd round)
+```{r}
+year_list <- c("data_again_1","data_again_2")
+HMM_models_noduplication(year_list)
+```
+
+#3rd round
+#22. Reload GPS and HMM output
+GPS2013 to GPS2022 contain the original GPS data with states assigned
+by the 1st round of HMM classification (chunk 12).
+The HMM files contain the re-classified results from the 2nd round
+of HMM classification (chunk 21), applied only to IDs that could not
+be classified in the 1st round.
+```{r}
+# Read processed GPS files (the one added state by the 1st round)
+for (yr in years) {
+  
+  gps_name <- paste0("GPS", yr)
+  gps_file <- paste0(processed_path, gps_name, ".csv")
+  
+  assign(
+    gps_name,
+    read_csv(gps_file, show_col_types = FALSE),
+    envir = .GlobalEnv
+  )
+}
+
+# Read HMM files from the 2nd round
+again_files <- list.files(
+  path = hmm_path,
+  pattern = "^HMM_data_again_.*\\.csv$",
+  full.names = TRUE
+)
+
+again_files <- sort(again_files)
+
+message(
+  "Reading 2nd-round HMM files: ",
+  paste(basename(again_files), collapse = ", ")
+)
+
+m3_again <- read_csv(
+  again_files,
+  show_col_types = FALSE
+)
+```
+
+#23. Match states to GPS data
+```{r}
+for (yr in years) {
+  
+  gps_name <- paste0("GPS", yr)
+  gps_df <- get(gps_name)
+  
+  updated_df <- update_state(gps_df, m3_again)
+  
+  assign(gps_name, updated_df, envir = .GlobalEnv)
+}
+```
+
+#24. Extract unclassified data
+```{r}
+#24. Extract unclassified data after 2nd round
+
+again_second <- extract_unclassified_data(
+  years = years,
+  threshold = 0.5,
+  output_name = "again_second"
+)
+
+if (nrow(again_second) == 0) {
+  message("All IDs are classified enough. No need to run the 3rd round.")
+} else {
+  message("Some IDs still need re-classification. Run the 3rd round.")
+}
+```
+
+
+#25. HMM State Classification (3rd round)
+```{r}
+if (nrow(again_second) > 0) {
+  year_list <- c("again_second")
+  HMM_models_noduplication(year_list)
+} else {
+  message("All IDs were classified after the 2nd round.")
+}
+```
+
+#26. Match states to GPS data (3rd round)
+```{r}
+#26. Match states to GPS data (3rd round)
+
+third_round_file <- paste0(hmm_path, "HMM_again_second.csv")
+
+if (file.exists(third_round_file)) {
+  
+  # Read HMM output from the 3rd round
+  m3_second <- read_csv(
+    third_round_file,
+    show_col_types = FALSE
+  )
+  
+  # Update GPS data using the new HMM states
+  for (yr in years) {
+    
+    gps_name <- paste0("GPS", yr)
+    gps_df <- get(gps_name)
+    
+    updated_df <- update_state(gps_df, m3_second)
+    
+    assign(gps_name, updated_df, envir = .GlobalEnv)
+  }
+  
+} else {
+  message("No 3rd-round HMM output found. Skipping update.")
+}
+```
+
+#27. Visualize
+```{r}
+my_palette <- c(
+  "Fast_Outbound" = "#E69F00",
+  "Fast_Middle"   = "yellowgreen",
+  "Fast_Homing"   = "cadetblue4",
+  "Slow"          = "grey"
+)
+
+japan_map <- map_data("world", region = "Japan")
+
+x_range <- c(141.1705, 143.0207)
+y_range <- c(38.82596, 41.48974)
+
+for (yr in years) {
+  
+  gps_name <- paste0("GPS", yr)
+  final_data <- get(gps_name)
+  id_list <- unique(final_data$ID)
+  
+  for (i in seq_along(id_list)) {
+    
+    data1 <- final_data %>%
+      filter(ID == id_list[i])
+    
+    p <- ggplot() +
+      geom_polygon(
+        data = japan_map,
+        aes(x = long, y = lat, group = group),
+        fill = "white",
+        color = "black"
+      ) +
+      geom_path(
+        data = data1,
+        aes(x = lon, y = lat),
+        linewidth = 1.2,
+        alpha = 0.5,
+        color = "snow2"
+      ) +
+      geom_point(
+        data = data1,
+        aes(x = lon, y = lat, color = State),
+        size = 1
+      ) +
+      coord_cartesian(xlim = x_range, ylim = y_range) +
+      theme_void() +
+      scale_color_manual(values = my_palette)
+    
+    ggsave(
+      filename = paste0(trip_path, "map_", id_list[i], ".png"),
+      plot = p,
+      width = 6,
+      height = 5,
+      dpi = 300
+    )
+  }
+}
+```
+
+#28. Output
+```{r}
+for (yr in years) {
+  
+  gps_name <- paste0("GPS", yr)
+  
+  write_csv(
+    get(gps_name),
+    paste0(output_path, gps_name, ".csv")
+  )
+}
+```
+
+#29. read data again
+```{r}
+for (yr in years) {
+  
+  gps_name <- paste0("GPS", yr)
+  gps_file <- paste0(output_path, gps_name, ".csv")
+  
+  assign(
+    gps_name,
+    read_csv(gps_file, show_col_types = FALSE),
+    envir = .GlobalEnv
+  )
+}
+```
+
+#30. Remove GPS points on land
+GPS points located on land are not used in this analysis.
+Set their State values to NA.
+```{r}
+#30. Remove GPS points on land
+# GPS points located on land are not used in this analysis.
+# Set their State values to NA.
+
+# Download Natural Earth ocean data
+ocean <- ne_download(
+  scale = 50,
+  type = "ocean",
+  category = "physical",
+  returnclass = "sf"
+)
+
+# Function to classify GPS points as sea or land
+classify_sealand <- function(df) {
+  
+  # Check whether lon and lat columns exist
+  if (!all(c("lon", "lat") %in% colnames(df))) {
+    stop("lon or lat column does not exist.")
+  }
+  
+  coords <- st_as_sf(
+    df,
+    coords = c("lon", "lat"),
+    crs = st_crs(ocean)
+  )
+  
+  sealand_matrix <- ifelse(
+    st_intersects(coords, ocean, sparse = FALSE),
+    "Land",
+    "Sea"
+  )
+  
+  # Convert sealand_matrix into a single character vector
+  df$sealand <- apply(sealand_matrix, 1, function(x) {
+    if ("Land" %in% x) {
+      return("Land")
+    } else {
+      return("Sea")
+    }
+  })
+  
+  return(df)
+}
+
+# Make a list of GPS data frames
+dfs <- mget(paste0("GPS", years))
+
+# Process each GPS data frame
+dfs_processed <- lapply(dfs, function(df) {
+  
+  df <- classify_sealand(df) %>%
+    group_by(ID) %>%
+    mutate(
+      first_Fast_Homing = ifelse(
+        any(State == "Fast_Homing", na.rm = TRUE),
+        min(which(State == "Fast_Homing")),
+        NA_integer_
+      ),
+      
+      # After the first Fast_Homing point,
+      # set State to NA if the point is classified as Land
+      State = ifelse(
+        is.na(first_Fast_Homing) | row_number() < first_Fast_Homing,
+        State,
+        ifelse(sealand == "Land", NA_character_, State)
+      )
+    ) %>%
+    ungroup() %>%
+    dplyr::select(-first_Fast_Homing)
+  
+  return(df)
+})
+
+# Reassign processed data frames back to GPS2013, GPS2014, etc.
+names(dfs_processed) <- paste0("GPS", years)
+list2env(dfs_processed, envir = .GlobalEnv)
+```
+
+#31. Visualize
+```{r}
+#36. Visualize after land removal
+
+my_palette <- c(
+  "Fast_Outbound" = "#E69F00",
+  "Fast_Middle"   = "yellowgreen",
+  "Fast_Homing"   = "cadetblue4",
+  "Slow"          = "grey"
+)
+
+japan_map <- map_data("world", region = "Japan")
+
+x_range <- c(141.1705, 143.0207)
+y_range <- c(38.82596, 41.48974)
+
+for (yr in years) {
+  
+  gps_name <- paste0("GPS", yr)
+  final_data <- get(gps_name)
+  id_list <- unique(final_data$ID)
+  
+  for (i in seq_along(id_list)) {
+    
+    data1 <- final_data %>%
+      filter(ID == id_list[i])
+    
+    p <- ggplot() +
+      geom_polygon(
+        data = japan_map,
+        aes(x = long, y = lat, group = group),
+        fill = "white",
+        color = "black"
+      ) +
+      geom_path(
+        data = data1,
+        aes(x = lon, y = lat),
+        linewidth = 1.2,
+        alpha = 0.5,
+        color = "snow2"
+      ) +
+      geom_point(
+        data = data1,
+        aes(x = lon, y = lat, color = State),
+        size = 1
+      ) +
+      coord_cartesian(xlim = x_range, ylim = y_range) +
+      theme_void() +
+      scale_color_manual(values = my_palette)
+    
+    ggsave(
+      filename = paste0(trip_path, "Sea/", "map_land_removed_", id_list[i], ".png"),
+      plot = p,
+      width = 6,
+      height = 5,
+      dpi = 300
+    )
+  }
+}
+```
+
+###################################################################
+Check the output data and adjust the conditions as needed.
+For example, try extracting exceptional trips individually and
+re-running HMM without excluding coastal points.
+###################################################################
+
+#32. Final Output
+```{r}
+for (yr in years) {
+  
+  gps_name <- paste0("GPS", yr)
+  
+  write_csv(
+    get(gps_name),
+    paste0(output_path, gps_name, ".csv")
+  )
+}
+```

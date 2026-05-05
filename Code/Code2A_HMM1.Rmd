@@ -1,0 +1,836 @@
+---
+title: "HMM1"
+output: html_document
+date: "2023-09-08"
+---
+##################################################################################
+This is now setted to do only 2013 data. Modify the comment out if you do other years
+##################################################################################
+
+This code classifies each GPS movement into one of the following 4 states at a specified sampling interval:
+  Outbound  (high speed movement away from colony)
+  Middle    (high speed movement in foraging area)
+  Homing    (high speed movement returning to colony)
+  Slow      (slow speed movement, e.g., resting on water)
+
+Classification is performed in 3 steps using CRW (Correlated Random Walk):
+
+Model 1
+  States : Directed, Slow (2 states)
+  Input  : Step length and turning angle between GPS points
+
+Model 2
+  States : Directed (CRW) and Slow for each of
+           Outbound / Middle / Homing (6 states total)
+  Input  : Transition constraints via fixbeta
+           (e.g., Outbound cannot transition directly to Homing),
+           and approach speed toward the colony
+
+Model 3
+  States : Fast_Outbound, Fast_Middle, Fast_Homing, Slow (4 states)
+           (all Slow states from Model 2 are merged into one)
+  Input  : BCRW (Biased Correlated Random Walk)
+           Bias is applied using approach speed toward the colony
+           (moving away from colony → Outbound,
+            approaching colony     → Homing)
+
+Main differences from the original code (Goto-san's version):
+  Problem: Individuals returning along the coastline caused
+           misclassification of the Homing state.
+           Coastal flight is not relevant to this analysis.
+  1. Excluded GPS points within 5 km of the coast before classification.
+  2. Added the option to classify using approach speed toward the
+     coastline instead of the colony
+     (colony-based speed was used in the final analysis).
+  3. Separated the repeated HMM fitting process into distinct chunks
+     for better readability.
+  4. Added handling for duplicate GPS points (identical lon/lat values),
+     which caused errors in the original code.
+     
+#1. library
+```{r}
+rm(list=ls())
+library(readr)
+library(dplyr)
+library(lubridate)
+library(stringr)
+library(SDLfilter)
+library(tidyverse)
+library(ggplot2)
+library(sp)
+library(crawl)
+library(xts)
+library(geosphere)
+library(adehabitatLT)
+library(tidyr)
+library(ncdf4)
+library(accelerometry)
+library(gridExtra)
+library(momentuHMM)
+#library(rgdal) #not available anymore
+library(tictoc)
+library(osmdata)
+library(sf)
+library(ggmap)
+library(leaflet)
+library(maps)
+library(rnaturalearth)
+```
+
+#2. read data and path
+```{r}
+base_path <- "~/Documents/yodalab/paper/JAB/data/not_for_upload/"
+hmm_path  <- paste0(base_path, "HMM_added/")
+input_path <- paste0(hmm_path, "input/")
+trip_path  <- paste0(hmm_path, "trip/")
+coast_check_path <- paste0(base_path, "removed_coast_points/")
+
+dir.create(hmm_path, showWarnings = FALSE, recursive = TRUE)
+dir.create(input_path, showWarnings = FALSE, recursive = TRUE)
+dir.create(trip_path, showWarnings = FALSE, recursive = TRUE)
+dir.create(coast_check_path, showWarnings = FALSE, recursive = TRUE)
+
+data <- read_csv(paste0(base_path, "data_resampled_all.csv"), show_col_types = FALSE)
+```
+
+
+#3. Define map
+To calculate the distance from coast
+```{r}
+japan_map <- map_data("world", region = "Japan")
+japan_map_interp <- japan_map %>%
+  group_by(group) %>%
+  do(data.frame(
+    long = approx(seq_along(.$long), .$long, n = 200 * length(.$long))$y,
+    lat = approx(seq_along(.$lat), .$lat, n = 200 * length(.$lat))$y
+  )) %>%
+  dplyr::filter(long >= 139, long <= 145.8260, lat >= 37, lat <= 44) %>%
+  ungroup()
+x_range <- c(141.1705, 143.0207)
+y_range <- c(38.82596, 41.48974)
+ggplot() +
+      geom_point(data = japan_map_interp, aes(x = long, y = lat, group = group), fill = "white", color = "black", size=0.2) +
+      coord_cartesian(xlim = x_range, ylim = y_range)
+```
+
+
+#4. Add the distance from coast
+Calculate the distance between every GPS point and all coastline points defined earlier, then store the minimum distance (i.e., the shortest distance between the bird and the coastline) in the coast_distance column
+```{r}
+# GPS points
+gps_sf <- st_as_sf(
+  data,
+  coords = c("lon", "lat"),
+  crs = 4326,
+  remove = FALSE
+)
+
+# Coastline points
+coast_sf <- st_as_sf(
+  japan_map_interp,
+  coords = c("long", "lat"),
+  crs = 4326
+)
+
+# Find nearest coastline point
+nearest_idx <- st_nearest_feature(gps_sf, coast_sf)
+
+# Nearest coastline coordinates
+nearest_coords <- japan_map_interp[nearest_idx, c("long", "lat")]
+
+# Calculate distance using the same method as before
+coast_distance <- distHaversine(
+  matrix(c(data$lon, data$lat), ncol = 2),
+  matrix(c(nearest_coords$long, nearest_coords$lat), ncol = 2)
+)
+
+data <- data %>%
+  mutate(
+    coast_lon = nearest_coords$long,
+    coast_lat = nearest_coords$lat,
+    coast_distance = coast_distance
+  )
+
+write_csv(
+  data,
+  paste0(base_path, "data_resampled_all_pluscoast.csv")
+)
+```
+
+
+#5. Remove GPS points too close to the coastline near the Homing phase
+###################################################################################################
+You can skip this step if your data does not contain confusing points that are neither approaching nor moving away from the coastline,
+or if you are using approach speed toward the colony rather than toward the coastline.
+####################################################################################################
+
+For HMM classification, I temporally removed the point close to coast.
+In my case, removing the portion where the bird is flying along the coastline on its way back to the colony improved the state classification.
+
+Divide each trip into two equal halves, and remove any GPS points within 5 km of the coastline in the second half only (to avoid accidentally removing GPS points that belong to non-Homing phases such as Outbound or Middle).
+
+####################################################################################################
+What I did: run HMM with both coast removed data and unromoved data, apply the one looks more well classified in each trip
+####################################################################################################
+
+##Mark
+```{r}
+data_check <- data %>%
+  group_by(ID) %>%
+  mutate(
+    total_rows = n(),
+    row_in_trip = row_number(),
+    remove_flag = row_in_trip > 0.5 * total_rows & coast_distance <= 5000
+  ) %>%
+  ungroup()
+id_list <- unique(data_check$ID)
+
+# Japan coastline map
+japan_map <- map_data("world", region = "Japan")
+
+out_place <- coast_check_path
+
+dir.create(
+  out_place,
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+```
+
+##Visualize
+```{r}
+for(i in seq_along(id_list)) {
+  
+  data1 <- data_check %>%
+    filter(ID == id_list[i])
+  
+  # Automatically set map range around each trip
+  x_range <- range(data1$lon, na.rm = TRUE) + c(-0.2, 0.2)
+  y_range <- range(data1$lat, na.rm = TRUE) + c(-0.2, 0.2)
+  
+  fig <- ggplot() +
+    
+    # Japan map
+    geom_polygon(
+      data = japan_map,
+      aes(x = long, y = lat, group = group),
+      fill = "white",
+      color = "black",
+      linewidth = 0.2
+    ) +
+    
+    # GPS points
+    geom_point(
+      data = data1,
+      aes(
+        x = lon,
+        y = lat,
+        color = remove_flag
+      ),
+      size = 0.8
+    ) +
+    
+    scale_color_manual(
+      values = c(
+        "FALSE" = "grey60",
+        "TRUE" = "red"
+      ),
+      labels = c(
+        "Kept",
+        "Removed"
+      )
+    ) +
+    
+    coord_cartesian(
+      xlim = x_range,
+      ylim = y_range
+    ) +
+    
+    theme_light() +
+    
+    labs(
+      title = id_list[i],
+      color = "Point status",
+      x = "Longitude",
+      y = "Latitude"
+    )
+  
+  ggsave(
+    filename = paste0(
+      out_place,
+      id_list[i],
+      "_removed_check_map.png"
+    ),
+    plot = fig,
+    width = 6,
+    height = 5,
+    dpi = 300
+  )
+}
+```
+##Removal
+```{r}
+# Function to remove points in the later half of each trip
+# when coast_distance is <= 5 km
+filter_function <- function(df) {
+  df %>%
+    group_by(ID) %>%
+    mutate(total_rows = n()) %>%
+    filter(!(row_number() > 0.5 * total_rows & coast_distance <= 5000)) %>%
+    ungroup() %>%
+    dplyr::select(-total_rows)
+}
+
+data_filtered <- filter_function(data)
+```
+
+
+#6. divide the big data
+Because sometimes R session crash, so need to divide data and save one by one
+If your PC is fancy, no need to do thi step
+```{r}
+ GPS2013 <- data_filtered %>% filter(year == 2013)
+# GPS2014 <- data_filtered %>% filter(year == 2014)
+# GPS2015 <- data_filtered %>% filter(year == 2015)
+# GPS2016 <- data_filtered %>% filter(year == 2016)
+# GPS2017 <- data_filtered %>% filter(year == 2017)
+# GPS2018 <- data_filtered %>% filter(year == 2018)
+# GPS2019 <- data_filtered %>% filter(year == 2019)
+# GPS2020 <- data_filtered %>% filter(year == 2020)
+# GPS2021 <- data_filtered %>% filter(year == 2021)
+# GPS2022 <- data_filtered %>% filter(year == 2022)
+# 
+# #2019
+# half_row <- nrow(GPS2019) %/% 2
+# 
+# GPS2019_1 <- GPS2019[1:half_row, ]
+# GPS2019_2 <- GPS2019[(half_row + 1):nrow(GPS2019), ]
+# 
+# #2020
+# half_row <- nrow(GPS2020) %/% 2
+# 
+# GPS2020_1 <- GPS2020[1:half_row, ]
+# GPS2020_2 <- GPS2020[(half_row + 1):nrow(GPS2020), ]
+# 
+# #2021
+# half_row <- nrow(GPS2021) %/% 2
+# 
+# GPS2021_1 <- GPS2021[1:half_row, ]
+# GPS2021_2 <- GPS2021[(half_row + 1):nrow(GPS2021), ]
+# 
+# #2022
+# split_size <- nrow(GPS2022) %/% 6
+# GPS2022_1 <- GPS2022[1:split_size, ]
+# GPS2022_2 <- GPS2022[(split_size + 1):(2 * split_size), ]
+# GPS2022_3 <- GPS2022[(2 * split_size + 1):(3 * split_size), ]
+# GPS2022_4 <- GPS2022[(3 * split_size + 1):(4 * split_size), ]
+# GPS2022_5 <- GPS2022[(4 * split_size + 1):(5 * split_size), ]
+# GPS2022_6 <- GPS2022[(5 * split_size + 1):nrow(GPS2022), ]
+
+```
+
+##save
+```{r}
+out_path <- input_path
+
+dir.create(
+  out_path,
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+write_csv(GPS2013, paste0(out_path, "GPS2013.csv"))
+# write_csv(GPS2014, paste0(out_path, "GPS2014.csv"))
+# write_csv(GPS2015, paste0(out_path, "GPS2015.csv"))
+# write_csv(GPS2016, paste0(out_path, "GPS2016.csv"))
+# write_csv(GPS2017, paste0(out_path, "GPS2017.csv"))
+# write_csv(GPS2018, paste0(out_path, "GPS2018.csv"))
+# write_csv(GPS2019_1, paste0(out_path, "GPS2019_1.csv"))
+# write_csv(GPS2019_2, paste0(out_path, "GPS2019_2.csv"))
+# write_csv(GPS2020_1, paste0(out_path, "GPS2020_1.csv"))
+# write_csv(GPS2020_2, paste0(out_path, "GPS2020_2.csv"))
+# write_csv(GPS2021_1, paste0(out_path, "GPS2021_1.csv"))
+# write_csv(GPS2021_2, paste0(out_path, "GPS2021_2.csv"))
+# write_csv(GPS2022_1, paste0(out_path, "GPS2022_1.csv"))
+# write_csv(GPS2022_2, paste0(out_path, "GPS2022_2.csv"))
+# write_csv(GPS2022_3, paste0(out_path, "GPS2022_3.csv"))
+# write_csv(GPS2022_4, paste0(out_path, "GPS2022_4.csv"))
+# write_csv(GPS2022_5, paste0(out_path, "GPS2022_5.csv"))
+# write_csv(GPS2022_6, paste0(out_path, "GPS2022_6.csv"))
+```
+
+# 7. Function to remove consecutive duplicate GPS points
+ Why this is needed:
+   HMM classification throws an error when the dataset contains
+   duplicate GPS points with identical latitude and longitude values.
+   This chunk removes those duplicates before re-attempting classification.
+```{r}
+# Remove consecutive duplicate GPS points
+# This removes only points that have exactly the same lon/lat as the previous point
+# within the same ID.
+# It does NOT remove points where the bird returned to the same location later.
+
+remove_consecutive_duplicates <- function(df, data_name = "data") {
+  
+  df_checked <- df %>%
+    arrange(ID, time) %>%
+    group_by(ID) %>%
+    mutate(
+      duplicate_point = !is.na(lag(lon)) &
+        lon == lag(lon) &
+        lat == lag(lat)
+    ) %>%
+    ungroup()
+  
+  n_duplicates <- sum(df_checked$duplicate_point, na.rm = TRUE)
+  
+  message(data_name, " contains ", n_duplicates, " consecutive duplicate GPS points.")
+  
+  df_clean <- df_checked %>%
+    filter(!duplicate_point) %>%
+    dplyr::select(-duplicate_point)
+  
+  return(df_clean)
+}
+```
+
+#8. Function of HMM State Classification Function (1st round)
+colony.angle : Angle between the direction to the colony and the current movement direction
+sea.angle    : colony.angle + 180 degrees (i.e., angle toward the open ocean, away from the colony)
+colony_speed : Speed at which the bird is moving away from the colony (negative value = approaching the colony)
+
+This classification start from model1→Model2→Model3, using input from previous model to refine the classificatio quality
+```{r}
+set.seed(1234) 
+sampling_dt <- 300 
+
+HMM_models_noduplication <- function(year_list) {
+  for (year in year_list) {
+    
+    year_label <- sub("^GPS", "", year)
+    
+    data <- tibble()
+    data0 <- read_csv(
+      paste0(input_path, year, ".csv"),
+      show_col_types = FALSE
+    )
+
+# Remove consecutive duplicate GPS points before HMM
+data0 <- remove_consecutive_duplicates(data0, year)
+
+# Remove x and y colum (recalculate later)
+data <- data0[, !(names(data0) %in% c("x", "y"))]
+ID_list <- data0$ID %>% unique()
+n_id    <-length(ID_list)
+
+#Specify time zone by NOAA NCAT tool
+#https://www.ngs.noaa.gov/NCAT/
+llcoord  <- SpatialPoints(cbind(data$lon,data$lat), proj4string=CRS("+proj=longlat +datum=WGS84"))
+utmcoord <- spTransform(llcoord, CRS("+proj=utm +zone=54 +ellps=WGS84"))
+ x <- attr(utmcoord,"coords")[,1]
+ y <- attr(utmcoord,"coords")[,2]
+ 
+ rawData <- data.frame(ID= data$ID, time=data$time,x=x,y=y)
+
+ crwOut <- crawlWrap(obsData=rawData,timeStep=paste(sampling_dt,"secs"),fixPar=c(NA,NA),attempts = 200, retryFits = 20,retryParallel=TRUE)
+ 
+#Colony location (141.5576031,40.5386062)
+ center_llcoord  <- SpatialPoints(cbind(141.5576031,40.5386062), proj4string=CRS("+proj=longlat +datum=WGS84"))
+ center_utmcoord <- spTransform(center_llcoord, CRS("+proj=utm +zone=54 +ellps=WGS84"))
+  center_x <- attr( center_utmcoord,"coords")[,1]
+  center_y <- attr( center_utmcoord,"coords")[,2]
+ center <- matrix(c(center_x ,center_y) ,nrow=1,dimnames=list("colony"))
+ 
+ #Add the distance and direction from the nest
+ Data <- prepData(data=crwOut,centers=center)
+ 
+#---------------------------------------------------------------
+#                  Potential another approach
+#---------------------------------------------------------------
+# To classify movement using approach speed toward the coastline instead of approach speed toward the colony, follow these steps:
+#
+#   1. Uncomment the block enclosed by the ### lines below.
+#   2. Change the following line:
+#        colony_speed <- data1$colony.dist %>% diff()/sampling_dt
+#      to:
+#        colony_speed <- data1$coast_distance %>% diff()/sampling_dt
+#
+# Based on testing, using approach speed toward the colony gave better
+# classification accuracy, so this block is currently commented out.
+# However, using approach speed toward the coastline may give better
+# results depending on the dataset, so the code is kept here for reference.
+###########################################################
+# # Extract the Japan region from the "world" dataset and store in japan_map
+# japan_map <- map_data("world", region = "Japan")
+#
+# # Interpolate the lat/lon data in japan_map and crop to the Japan region
+# japan_map_interp <- japan_map %>%
+#   group_by(group) %>%
+#   do(data.frame(
+#     long = approx(seq_along(.$long), .$long, n = 100 * length(.$long))$y,
+#     lat = approx(seq_along(.$lat), .$lat, n = 100 * length(.$lat))$y
+#   )) %>%
+#   dplyr::filter(long >= 139, long <= 145.8260, lat >= 37, lat <= 44) %>%
+#   ungroup()
+#
+# # Convert lat/lon data to an sf object
+# sf_object <- st_as_sf(japan_map_interp, coords = c("long", "lat"), crs = 4326)
+#
+# # Transform the sf object to UTM coordinate system
+# sf_utm <- st_transform(sf_object, crs = "+proj=utm +zone=54 +datum=WGS84")
+#
+# # Extract x/y coordinates in the UTM plane
+# japan_map_interp$x <- st_coordinates(sf_utm)[, 1]
+# japan_map_interp$y <- st_coordinates(sf_utm)[, 2]
+#
+# # Define a function that calculates the shortest distance
+# # from a given x, y coordinate to the coastline
+# nearest_point_distance <- function(x, y) {
+#   distances <- sqrt((japan_map_interp$x - x)^2 + (japan_map_interp$y - y)^2)
+#   min_dist <- min(distances)
+#   min_index <- which.min(distances)
+#   list(coast_x = japan_map_interp[min_index, "x"],
+#        coast_y = japan_map_interp[min_index, "y"],
+#        coast_distance = min_dist)
+# }
+#
+# # Apply the function defined above to each row of Data
+# nearest_points <- pmap(Data[, c("x", "y")], nearest_point_distance)
+# nearest <- nearest_points %>%
+#     map_dfr(~{
+#       tibble(
+#         coast_x = .[["coast_x"]] %>% pull(),
+#         coast_y = .[["coast_y"]] %>% pull(),
+#         coast_distance = .[["coast_distance"]]
+#       )
+#     })
+#
+# # Distance unit is kept in meters
+#
+# # When comparing floating point numbers, allow a small tolerance
+# tolerance <- 1e-3 # 1mm tolerance
+#
+# Data <- bind_cols(Data, nearest)
+###########################################################
+
+#Add speed 
+ID_list <- Data$ID %>% unique()
+n_id    <-length(ID_list)
+Data_new <-tibble()
+for(i in 1:n_id){
+  print(i)
+      data1 <- Data %>% 
+              filter(ID==ID_list[i])
+      colony_speed <- data1$colony.dist %>% diff()/sampling_dt
+      data1<- mutate(data1[1:(nrow(data1)-1),],colony_speed)
+  Data_new <- rbind(Data_new,data1)
+}
+   Data <- Data_new
+ Data$sea.angle <-atan2(sin(Data$colony.angle+pi),cos(Data$colony.angle+pi))
+
+#Model1
+
+tic()
+# Distribution
+ dist = list(step="gamma",angle="wrpcauchy") 
+# State name
+ stateNames <- c("Directed","Water")
+ 
+  mean_step <- mean(Data$step,na.rm = T)
+  Par0_m1 <- list( step  = mean_step*c(1.2, 0.2,
+                                        0.5, 0.5),#state1mu, state2mu, state1sd, state2sd
+                   angle = c(0.9, 0.2)#state1first angle, state2first angle
+                 )
+
+# Zero-mass version was tested but not adopted,
+# as the standard version gave better classification results
+#Par0_m1 <- list( step  = c(mean_step*c(1.2, 0.2,
+#                                        0.5,0.5),0.1,0.1),
+#                   angle = c(0.9, 0.2)
+#                 )
+
+Data <- ungroup(Data)
+m1 <- fitHMM(data = Data, nbStates = 2, dist = dist, Par0 =Par0_m1,stateNames = stateNames)
+
+#######
+assign(paste0("m1_", year_label), m1)
+toc()
+
+#Model2
+#Consider the approaching speed toward colony
+#[outbound] Directed(CRW), Water
+#[middle  ] Directed(CRW), Water
+#[homing  ] Directed(CRW), Water
+
+tic()
+ Par_m1<- getPar(m1)
+#Distribution
+ dist = list(step="gamma",angle="wrpcauchy",colony_speed="norm") 
+#State name
+ stateNames <- c("Directed_Out","Water_Out",
+                 "Directed_Mid","Water_Mid",
+                 "Directed_Hom","Water_Return"
+                 )
+ 
+
+  Par0_m2 <- list( step =  c(Par_m1$Par$step[1:2],
+                             Par_m1$Par$step[1:2],
+                             Par_m1$Par$step[1:2],
+                             Par_m1$Par$step[3:4],
+                             Par_m1$Par$step[3:4],
+                             Par_m1$Par$step[3:4]
+                             ),
+                   
+                 angle =  c(Par_m1$Par$angle,
+                            Par_m1$Par$angle,
+                            Par_m1$Par$angle
+                            ),
+                 
+                 colony_speed = c(7, 0, 0, 0,-7, 0,
+                                  1, 2, 4, 2, 1, 2)
+                                 )
+  
+  
+fixbeta <-matrix(c(         NA,   NA,-1000,-1000,-1000,
+                      NA,         NA,-1000,-1000,-1000,
+                   -1000,-1000,         NA,   NA,-1000,
+                   -1000,-1000,   NA,         NA,-1000,
+                   -1000,-1000,-1000,-1000,         NA,
+                   -1000,-1000,-1000,-1000,   NA
+
+                   ),nrow=1
+                 )  
+  
+# Specify the known states at the start and end points of each trip
+ID_index <- rle2(Data$ID,indices=TRUE)%>%as.data.frame()          
+knownStates <- rep(NA,nrow(Data))
+knownStates[ID_index$start] <- 1
+knownStates[ID_index$stop] <-  5
+
+
+m2 <- fitHMM(data = Data, nbStates = 6, dist = dist,
+             Par0 =Par0_m2,
+             stateNames = stateNames,
+             fixPar=list(beta=fixbeta),
+             knownStates = knownStates)
+
+
+toc()
+
+# Model 3
+# Incorporates approach speed toward the colony.
+# Outbound and Homing phases use BCRW (Biased Correlated Random Walk),
+# resulting in 6 states total:
+#   [Outbound] Directed (BRW: biased away from colony), Slow
+#   [Middle  ] Directed (CRW: no bias),                 Slow
+#   [Homing  ] Directed (BRW: biased toward colony),    Slow
+
+tic()
+
+ angleDMp <- matrix(c("sea.angle",             0, 0,0,
+                                0,             0, 0,0,
+                      
+                                0,             0, 0,0,
+                                0,             0, 0,0,
+                      
+                                0,"colony.angle", 0,0,
+                                0,             0, 0,0,
+                      
+                                0,             0, 1,0,
+                                0,             0, 0,1,
+                      
+                                0,             0, 1,0,
+                                0,             0, 0,1,
+                      
+                                0,             0, 1,0,
+                                0,             0, 0,1
+
+                    ),nrow=12,byrow=TRUE
+                    )
+
+fixPar <- list(beta=fixbeta)
+
+ stepDMp <- matrix(c(1,0,0,0,
+                     0,1,0,0,
+                     1,0,0,0,
+                     0,1,0,0,
+                     1,0,0,0,
+                     0,1,0,0,
+                     0,0,1,0,
+                     0,0,0,1,
+                     0,0,1,0,
+                     0,0,0,1,
+                     0,0,1,0,
+                     0,0,0,1
+                     ),nrow=12,byrow=TRUE)
+ 
+rownames(stepDMp) <- c("mean:Directed_Out","mean:Water_Out",
+                       "mean:Directed_Mid","mean:Water_Mid",
+                       "mean:Directed_Hom","mean:Water_Return",
+                       "SD:Directed_Out"  ,"SD:Water_Out",
+                       "SD:Directed_Mid"  ,"SD:Water_Mid",
+                       "SD:Directed_Hom"  ,"SD:Water_Return"
+                       )
+
+colnames(stepDMp) <- c("mean:Directed","mean:Water",
+                       "SD:Directed"  ,"SD:Water"
+                       )
+
+ colony_speedDMp <- matrix(
+                   c(1,0,0,0,0,0,
+                     0,0,0,0,0,0,
+                     
+                     0,0,0,0,0,0,
+                     0,0,0,0,0,0,
+                     
+                     0,1,0,0,0,0,
+                     0,0,0,0,0,0,
+                     
+                     0,0,1,0,0,0,
+                     0,0,0,1,0,0,
+                     
+                     0,0,0,0,1,0,
+                     0,0,0,1,0,0,
+                     
+                     0,0,0,0,0,1,
+                     0,0,0,1,0,0
+                     
+                     ),nrow=12,byrow=TRUE)
+
+Par0 <- getPar0(model=m2)
+
+
+m3 <- fitHMM(data = Data, nbStates = 6, dist = dist, 
+             Par0 =list(step=log(c(Par0$Par$step[1:2],Par0$Par$step[7:8])),
+                        angle=c(0.2,0.2,0.2,0.01),
+                        colony_speed = c(Par0$Par$colony_speed[1],Par0$Par$colony_speed[5],
+                                         Par0$Par$colony_speed[7],Par0$Par$colony_speed[8],
+                                         Par0$Par$colony_speed[9],Par0$Par$colony_speed[11]
+                                         )
+                                         ),
+             beta0=Par0$beta,
+             fixPar=fixPar,
+             DM = list(step = stepDMp,angle=angleDMp,colony_speed=colony_speedDMp),
+             estAngleMean = list(angle=TRUE),
+             circularAngleMean = list(angle=TRUE),
+             stateNames = stateNames,
+             knownStates = knownStates)
+
+toc()
+
+#Output
+out_place <- hmm_path
+# Define UTM coordinates
+utmcoord <- SpatialPoints(cbind(Data$x,Data$y), proj4string=CRS("+proj=utm +zone=54 +ellps=WGS84"))
+# Convert UTM coordinates back to latitude/longitude
+# Reference: http://spatiohack.blogspot.com/2010/11/r_15.html
+new.crs <- CRS("+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs")
+llcoord <- spTransform(utmcoord, CRS=new.crs)
+
+lon <- attr(llcoord,"coords")[,1]
+lat <- attr(llcoord,"coords")[,2]
+
+Data <- mutate(Data,lon)
+Data <- mutate(Data,lat)
+
+# Determine the most likely state at each time step using the Viterbi algorithm
+states <- viterbi(m3) %>% as.character()
+
+states <- sub("1","Fast_Outbound", states)
+states <- sub("3","Fast_Middle", states)
+states <- sub("5","Fast_Homing", states)
+states <- sub("2","Slow", states)
+states <- sub("4","Slow", states)
+states <- sub("6","Slow", states)
+
+outData <- mutate(Data,State=states)
+
+assign(paste0("m3_", year_label), m3)
+
+write_csv(outData,paste0(out_place,"HMM_",year,".csv"))
+}
+}
+```
+
+#9. Run HMM
+```{r}
+#If you want to do one by one
+year_list <- c("GPS2013")
+
+#If you want to do all
+# year_list <- c("GPS2013","GPS2014","GPS2015","GPS2016","GPS2017","GPS2018","GPS2019","GPS2020_1", "GPS2020_2","GPS2021_1", "GPS2021_2","GPS2022_1","GPS2022_2","GPS2022_3","GPS2022_4,"GPS2022_5","GPS2022_6")
+
+HMM_models_noduplication(year_list)
+```
+
+#10. Visualize the first round
+```{r}
+my_palette <- c(
+  "Fast_Outbound" = "#E69F00",
+  "Fast_Middle"   = "yellowgreen",
+  "Fast_Homing"   = "cadetblue4",
+  "Slow"          = "grey"
+)
+
+in_place  <- hmm_path
+out_place <- trip_path
+
+dir.create(out_place, showWarnings = FALSE, recursive = TRUE)
+
+year_list <- c("HMM_GPS2013")
+#year_list <- c("HMM_GPS2013","HMM_GPS2014","HMM_GPS2015","HMM_GPS2016","HMM_GPS2017","HMM_GPS2018","HMM_GPS2019","HMM_GPS2020","HMM_GPS2021","HMM_GPS2022")
+
+
+japan_map <- map_data("world", region = "Japan")
+
+x_range <- c(141.1705, 143.0207)
+y_range <- c(38.82596, 41.48974)
+
+for (year in year_list) {
+  
+  final_data <- read_csv(
+    paste0(in_place, year, ".csv"),
+    show_col_types = FALSE
+  )
+  
+  id_list <- unique(final_data$ID)
+  
+  for (i in seq_along(id_list)) {
+    
+    data1 <- final_data %>%
+      filter(ID == id_list[i])
+    
+    p <- ggplot() +
+      geom_polygon(
+        data = japan_map,
+        aes(x = long, y = lat, group = group),
+        fill = "white",
+        color = "black"
+      ) +
+      geom_path(
+        data = data1,
+        aes(x = lon, y = lat),
+        linewidth = 1.2,
+        alpha = 0.5,
+        color = "snow2"
+      ) +
+      geom_point(
+        data = data1,
+        aes(x = lon, y = lat, color = State),
+        size = 1
+      ) +
+      coord_cartesian(xlim = x_range, ylim = y_range) +
+      theme_void() +
+      scale_color_manual(values = my_palette)
+    
+    ggsave(
+      filename = paste0(out_place, "map_", id_list[i], ".png"),
+      plot = p,
+      width = 6,
+      height = 5,
+      dpi = 300
+    )
+  }
+}
+```
+
