@@ -1,0 +1,53 @@
+From ERA5α (https://cds.climate.copernicus.eu/datasets/reanalysis-era5-single-levels?tab=download)
+This data is used to visualize wind environment around Kabushima Island, Japan. 
+Code6 need to be run by this wind data because need to use the same range of longitude/latitude throughout all years.
+
+2013 year wind data：
+time range： 2013-03-01 to 2013-09-30 23:00:00 
+lon range： 141.1 to 144.1 
+lat range： 39.5 to 42 
+
+2014 year wind data：
+time range： 2014-03-01 to 2014-09-30 23:00:00 
+lon range： 141.1 to 144.1 
+lat range： 39.5 to 42 
+
+2015 year wind data：
+time range： 2015-03-01 to 2015-09-30 23:00:00 
+lon range： 141.1 to 144.1 
+lat range： 39.5 to 42 
+
+2016 year wind data：
+time range： 2016-03-01 to 2016-09-30 23:00:00 
+lon range： 141.1 to 144.1 
+lat range： 39.5 to 42 
+
+2017 year wind data：
+time range： 2017-03-01 to 2017-09-30 23:00:00 
+lon range： 141.1 to 144.1 
+lat range： 39.5 to 42 
+
+2018 year wind data：
+time range： 2018-03-01 to 2018-09-30 23:00:00 
+lon range： 141.1 to 144.1 
+lat range： 39.5 to 42 
+
+2019 year wind data：
+time range： 2019-03-01 to 2019-09-30 23:00:00 
+lon range： 141.1 to 144.1 
+lat range： 39.5 to 42 
+
+2020 year wind data：
+time range： 2020-03-01 to 2020-09-30 23:00:00 
+lon range： 141.1 to 144.1 
+lat range： 39.5 to 42
+
+2021 year wind data：
+time range： 2021-03-01 to 2021-09-30 23:00:00 
+lon range： 141.1 to 144.1 
+lat range： 39.5 to 42 
+
+2022 year wind data：
+time range： 2022-03-01 to 2022-09-30 23:00:00 
+lon range： 141.1 to 144.1 
+lat range： 39.5 to 42 
