@@ -1,0 +1,319 @@
+---
+title: "Code8_Coast_Deviation"
+output: html_document
+date: "2026-09-01"
+---
+---
+title: "New12_目的地を巣以外にする"
+output: html_document
+date: "2026-07-14"
+---
+
+#library
+```{r}
+rm(list=ls())
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(ggplot2)
+library(readr)
+library(dplyr)
+library(sf)
+library(ggspatial)
+library(circular)
+library(ncdf4)
+library(maps)
+library(lubridate)
+library(viridis)
+library(purrr)
+library(extrafont)
+library(patchwork)
+library(tidyr)
+library(tidyverse)
+library(gridExtra)
+library(lme4)
+library(ggeffects)
+library(geosphere)
+library(here)
+library(ggplot2)
+library(RColorBrewer)
+library(slider)
+library(emmeans)
+```
+
+#data
+```{r}
+rm(list=ls())
+
+#Read final data after all claning
+all_sea_data <- read_csv("~/Documents/yodalab/data/final_data/Original_from_yodalab/Windcompensation/all_sea_data_wind_recalculated.csv")
+
+all_sea_data <- all_sea_data[!is.na(all_sea_data$age), ]
+
+#Read date before HMM classification (before removing coast)
+out_dir <- "~/Documents/yodalab/data/middle_data/Added/No3_5min_resampled/fixed/"
+all_data <- map_dfr(
+  file.path(out_dir, paste0("GPS", 2013:2022, ".csv")),
+  read_csv
+)
+```
+
+
+#Recover the coastal flight
+Coastal flights have already been excluded from the post-HMM data, so the current dataset contains only the homing portion. Here, we want to add back the GPS data from Code 3 before coastal flights were excluded.
+We can do this by adding all GPS points that follow the homing portion.
+```{r}
+# Find the last timestamp for each ID (trip)
+last_time_by_ID <- all_sea_data %>%
+  group_by(ID) %>%
+  summarise(
+    last_time = max(time, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Find the continuation of each trip in all_data
+# Keep only IDs that are present in all_sea_data
+continuation_data <- all_data %>%
+  inner_join(last_time_by_ID, by = "ID")
+
+# Keep only points recorded after the last timestamp in all_sea_data
+continuation_data <- continuation_data %>%
+  filter(time > last_time)
+
+# Remove the temporary last_time column
+continuation_data <- continuation_data %>%
+  dplyr::select(-last_time)
+
+
+# Label the added points as "coast" for HomingID, State, and original_state
+continuation_data <- continuation_data %>%
+  mutate(HomingID = "coast") %>% 
+  mutate(State = "coast") %>% 
+  mutate(original_state = "coast")
+
+
+# Add the continuation data back to all_sea_data
+all_sea_data_extended <- bind_rows(all_sea_data, continuation_data)
+all_sea_data_extended <- all_sea_data_extended %>% arrange(ID, time)
+```
+
+#Recalculate distance to the coast
+```{r}
+# Convert the coastline into a dense set of points
+japan_map <- map_data("world", region = "Japan")
+japan_map_interp <- japan_map %>%
+  group_by(group) %>%
+  do(data.frame(
+    long = approx(seq_along(.$long), .$long, n = 200 * length(.$long))$y,
+    lat = approx(seq_along(.$lat), .$lat, n = 200 * length(.$lat))$y
+  )) %>%
+  dplyr::filter(long >= 139, long <= 145.8260, lat >= 37, lat <= 44) %>%
+  ungroup()
+
+# Define a function that returns the nearest coastline point
+# and its distance for each GPS location
+nearest_point_distance <- function(lon, lat) {
+
+  distances <- distHaversine(
+    matrix(c(lon, lat), ncol = 2),
+    matrix(c(japan_map_interp$long, japan_map_interp$lat), ncol = 2)
+  )
+
+  min_index <- which.min(distances)
+
+  tibble(
+    coast_lon = japan_map_interp$long[min_index],
+    coast_lat = japan_map_interp$lat[min_index],
+    coast_distance = distances[min_index]
+  )
+}
+
+# Remove existing coast-related columns before recalculating them
+all_sea_data_extended <- all_sea_data_extended %>%
+  dplyr::select(-any_of(c("coast_lon", "coast_lat", "coast_distance")))
+
+nearest <- pmap_dfr(
+  all_sea_data_extended[, c("lon", "lat")],
+  nearest_point_distance
+)
+
+all_sea_data_extended <- bind_cols(
+  all_sea_data_extended,
+  nearest
+)
+```
+
+#Save
+```{r}
+write.csv(all_sea_data_extended, "~/Documents/yodalab/data/middle_data/Added/No6_coast_readded_byreview/all_data_coast_distance.csv")
+```
+
+#Read
+```{r}
+all_sea_data_extended <- read_csv("~/Documents/yodalab/data/middle_data/Added/No6_coast_readded_byreview/all_data_coast_distance.csv")
+```
+
+# Identify the first point where the bird transitions to coastal movement
+```{r}
+# Keep all columns up to coast_distance and remove columns to the right
+all_sea_data_extended <- all_sea_data_extended %>%
+  dplyr::select(1:coast_distance)
+
+# 1. Calculate approach speed toward the coast for each ID
+all_sea_data_extended <- all_sea_data_extended %>%
+  arrange(ID, time) %>%
+  group_by(ID) %>%
+  mutate(
+    dt_sec = as.numeric(
+      difftime(time, lag(time), units = "secs")
+    ),
+    # Positive values = approaching the coast
+    # Values near 0 = little change in distance to the coast
+    # Negative values = moving away from the coast
+    coast_approach_speed =
+      (lag(coast_distance) - coast_distance) / dt_sec
+  ) %>%
+  ungroup()
+
+
+# 2. Calculate approach speed before and after each potential transition point
+all_sea_data_extended <- all_sea_data_extended %>%
+  arrange(ID, time) %>%
+  group_by(ID) %>%
+  mutate(
+    
+    # Mean approach speed over the previous three points
+    approach_speed_before =
+      (
+        lag(coast_approach_speed, 1) +
+        lag(coast_approach_speed, 2) +
+        lag(coast_approach_speed, 3)
+      ) / 3,
+    
+    # Mean approach speed over the current and next two points
+    approach_speed_after =
+      (
+        coast_approach_speed +
+        lead(coast_approach_speed, 1) +
+        lead(coast_approach_speed, 2)
+      ) / 3,
+    
+    # Amount by which approach speed toward the coast decreases
+    approach_speed_drop =
+      approach_speed_before - approach_speed_after
+  ) %>%
+  ungroup()
+
+
+# 3. Standard criterion:
+#    For each ID, identify the first point within 2 km of the coast
+#    where the approach speed toward the coast decreases
+closest_coast_point <- all_sea_data_extended %>%
+  filter(
+    !is.na(approach_speed_drop),
+    coast_distance < 2000,        # Within 2 km of the coast
+    approach_speed_before > 0,    # Previously approaching the coast
+    approach_speed_drop > 0       # Approach speed subsequently decreased
+  ) %>%
+  arrange(ID, time) %>%
+  group_by(ID) %>%
+  slice(1) %>%
+  ungroup() %>%
+  dplyr::select(
+    ID,
+    closest_coast_time = time,
+    closest_coast_lon = lon,
+    closest_coast_lat = lat,
+    coast_distance_at_transition = coast_distance
+  )
+
+
+# 4. Fallback:
+#    For IDs where no closest-coast point was identified using the standard criterion,
+#    use the final point as the closest-coast point if it is:
+#    ・more than 5 km from the nest
+#    ・within 2 km of the coast
+last_point_fallback <- all_sea_data_extended %>%
+  arrange(ID, time) %>%
+  group_by(ID) %>%
+  slice_tail(n = 1) %>%
+  ungroup() %>%
+  filter(
+    Nest_Distance > 5000,        # More than 5 km from the nest
+    coast_distance < 2000        # Within 2 km of the coast
+  ) %>%
+  anti_join(
+    closest_coast_point %>% dplyr::select(ID),
+    by = "ID"
+  ) %>%
+  dplyr::select(
+    ID,
+    closest_coast_time = time,
+    closest_coast_lon = lon,
+    closest_coast_lat = lat,
+    coast_distance_at_transition = coast_distance
+  )
+
+
+# 5. Combine points identified by the standard criterion and fallback
+closest_coast_point <- bind_rows(
+  closest_coast_point,
+  last_point_fallback
+)
+
+
+# 6. Add transition-point information to all_sea_data_extended
+all_sea_data_extended <- all_sea_data_extended %>%
+  left_join(
+    closest_coast_point,
+    by = "ID"
+  )
+```
+
+#Use the nest as the closest-coast goal when no separate coastal transition is identified
+```{r}
+# 1. Nest location
+
+location_nest_data <- data.frame(
+  lon = 141.5576031,
+  lat = 40.5386062
+)
+
+nest_lon <- location_nest_data$lon[1]
+nest_lat <- location_nest_data$lat[1]
+
+# 2. Set the closest-coast point as the goal
+#    If a coastal transition point is identified: goal = closest coast
+#    If no coastal transition point is identified: goal = nest
+
+all_sea_data_extended <- all_sea_data_extended %>%
+  mutate(
+    goal_lon = if_else(
+      !is.na(closest_coast_lon),
+      closest_coast_lon,
+      nest_lon
+    ),
+    goal_lat = if_else(
+      !is.na(closest_coast_lat),
+      closest_coast_lat,
+      nest_lat
+    ),
+    goal = if_else(
+      !is.na(closest_coast_lon),
+      "coast", "nest"
+    )
+  )
+
+# 7. Calculate goal deviation for each ID
+
+goal_summary <- all_sea_data_extended %>%
+  distinct(ID, age, label, foot, goal, goal_lon, goal_lat) %>%
+  rowwise() %>%
+  mutate(
+    goal_deviation_straight = distHaversine(
+      c(goal_lon, goal_lat),
+      c(nest_lon, nest_lat)
+    )
+  ) %>%
+  ungroup()
+```
